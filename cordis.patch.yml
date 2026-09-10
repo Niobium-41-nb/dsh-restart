@@ -1,0 +1,9 @@
+# dsh bundle layer: mount the out-of-process restart supervisor.
+#
+# The plugin registers the `dsh_restart` / `dsh_restart_status` tools and keeps
+# a small control agent alive on a loopback port. The agent owns process
+# restart, the last-known-good configuration baseline, and the failure report
+# handed back to the next boot.
+- insert:
+    - id: dsh-restart
+      name: 'dsh-restart'

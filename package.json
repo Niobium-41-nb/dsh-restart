@@ -1,0 +1,73 @@
+{
+  "name": "dsh-restart",
+  "version": "0.1.0",
+  "description": "Out-of-process restart supervisor for DeepSeek Harness: a small control agent on its own port restarts dsh, rolls the profile configuration back to the last known-good snapshot when the new boot fails, and hands the failure report to the restarted harness",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./agent": "./lib/agent.js",
+    "./package.json": "./package.json",
+    "./client": "./client/index.js"
+  },
+  "bin": {
+    "dsh-restart": "./bin/dsh-restart.mjs"
+  },
+  "files": [
+    "lib",
+    "bin",
+    "client",
+    "cordis.patch.yml",
+    "README.md",
+    "DESIGN.md"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.1",
+    "@types/node": "^22.20.0",
+    "tsdown": "^0.22.2",
+    "typescript": "^6.0.3"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "restart",
+    "supervisor",
+    "rollback"
+  ],
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  }
+}

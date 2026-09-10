@@ -1,0 +1,12 @@
+# Dependencies and build output
+node_modules/
+lib/
+*.tsbuildinfo
+
+# Scratch state written by the test suites
+.test-state/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.log
