@@ -272,4 +272,6 @@ node --import tsx/esm apps/cli/src/bin.ts plugin --profile web add file:<PLUGINS
 `instances/<key>` 旁边的入口拉起的，重启 DSH 后新进程会用新代码。
 插件侧（`lib/index.js`）必须走上面的重装流程 + 一次重启。
 
+接下来要做什么，见 [ROADMAP.md](ROADMAP.md)；工作区级的硬规则与验证手册见 `../AGENTS.md`。
+
 详见 [DESIGN.md](DESIGN.md)。
