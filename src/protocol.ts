@@ -186,6 +186,51 @@ export interface RestartReport {
   deliveredAt?: string
 }
 
+/**
+ * One session's request to be woken again after the restart it asked for.
+ *
+ * A restart is the only operation that ends a turn *and* the process running
+ * it, so the conversation stops there: the model writes its closing message,
+ * the tree goes down, and nothing in the new process knows a task was in
+ * flight. The model then waits for the human to say "go on" — which is the
+ * whole reason this record exists.
+ *
+ * It is written by the process that is about to die (the requesting session is
+ * only knowable there) and claimed by the process that boots in its place.
+ * Claiming is recorded *before* the session is woken: an intent must never be
+ * able to resume twice, however the boot ends.
+ */
+export interface ResumeIntent {
+  version: number
+  /** Session whose turn was cut off by the restart. */
+  sessionId: string
+  /** Working directory of the requesting process, for diagnostics. */
+  cwd?: string
+  /**
+   * The reason the model gave when it asked for the restart.
+   *
+   * Untrusted, model-authored text: it is quoted as data in the resume
+   * framing, never interpolated into it as instructions.
+   */
+  reason: string
+  requestedAt: string
+  /** PID of the process that requested the restart. */
+  fromPid: number
+  /** Instance key the request belonged to; a boot ignores another instance's intent. */
+  instance: string
+  /**
+   * Agent preset the requesting session ran under, when it could be read.
+   *
+   * The resumed agent is mounted with the same preset, so waking a session
+   * does not silently swap its tools and system prompt for the defaults.
+   */
+  agentPreset?: string
+  /** Set by the boot that claimed this intent (see the type comment). */
+  consumedAt?: string
+  /** How the claim ended, for diagnostics. */
+  outcome?: string
+}
+
 /** A single tracked file inside a baseline snapshot. */
 export interface BaselineEntry {
   /** Absolute path the entry restores to. */

@@ -29,14 +29,21 @@ function ok(label, condition, detail = '') {
 const eq = (label, actual, expected) => ok(label, JSON.stringify(actual) === JSON.stringify(expected), `actual ${JSON.stringify(actual)}`)
 
 /** Load the client bundle the way the host's module loader does. */
-function loadClient(reactImpl) {
+function loadClient(reactImpl, stubs = {}) {
   const loads = []
   globalThis.window = {
     __ModuleLoader__: { load: (definition) => { loads.push(definition) } },
-    localStorage: {
+    localStorage: stubs.localStorage ?? {
       getItem: () => null,
       setItem: () => {},
+      removeItem: () => {},
     },
+    sessionStorage: stubs.sessionStorage ?? {
+      getItem: () => null,
+      setItem: () => {},
+      removeItem: () => {},
+    },
+    location: stubs.location ?? { reload: () => {} },
     setInterval: () => 0,
     clearInterval: () => {},
   }
@@ -44,7 +51,10 @@ function loadClient(reactImpl) {
   const path = fileURLToPath(new URL('../client/index.js', import.meta.url))
   const source = readFileSync(path, 'utf8')
   // eslint-disable-next-line no-new-func -- executes the captured bundle text.
-  new Function('window', 'document', source)(globalThis.window, { addEventListener: () => {} })
+  new Function('window', 'document', source)(
+    globalThis.window,
+    stubs.document ?? { addEventListener: () => {} },
+  )
 
   ok('the bundle registers exactly one module', loads.length === 1)
   const definition = loads[0]
@@ -64,6 +74,67 @@ function loadClient(reactImpl) {
     throw new Error(`unexpected require: ${id}`)
   })
   return { exports, react }
+}
+
+/** A storage stub with the three methods the bundle uses. */
+function makeStore() {
+  const map = new Map()
+  return {
+    getItem: (key) => (map.has(key) ? map.get(key) : null),
+    setItem: (key, value) => { map.set(key, String(value)) },
+    removeItem: (key) => { map.delete(key) },
+    raw: map,
+  }
+}
+
+/**
+ * A DOM just large enough for the notice card: elements, ids, and the
+ * append/remove bookkeeping the renderer relies on.
+ */
+function makeDom() {
+  const byId = new Map()
+  const nodes = []
+  const element = (tagName) => {
+    const node = {
+      tagName,
+      id: '',
+      children: [],
+      parentNode: null,
+      attributes: {},
+      textContent: '',
+      style: { cssText: '', setProperty(name, value) { node.style[name] = value } },
+      appendChild(child) {
+        child.parentNode = node
+        node.children.push(child)
+        if (child.id !== '') byId.set(child.id, child)
+        return child
+      },
+      removeChild(child) {
+        node.children = node.children.filter((entry) => entry !== child)
+        child.parentNode = null
+        if (child.id !== '') byId.delete(child.id)
+        return child
+      },
+      setAttribute(name, value) { node.attributes[name] = value },
+      getAttribute(name) { return node.attributes[name] },
+    }
+    nodes.push(node)
+    return node
+  }
+  const body = element('body')
+  return {
+    body,
+    /** Every element ever created, including ones later removed. */
+    nodes,
+    createElement: (tagName) => element(tagName),
+    getElementById: (id) => byId.get(id) ?? null,
+    /** All text under one element, flattened. */
+    textOf(node) {
+      if (node === null || node === undefined) return []
+      const own = node.textContent === '' ? [] : [node.textContent]
+      return [...own, ...node.children.flatMap((child) => this.textOf(child))]
+    },
+  }
 }
 
 process.stdout.write('\nthe client module contract\n')
@@ -317,6 +388,188 @@ process.stdout.write('\na broken indicator never breaks the page\n')
   }
   console.warn = originalWarn
   ok('no react means no registration, and no throw', threw === false && registered.length === 0, `threw=${String(threw)} registered=${String(registered.length)}`)
+}
+
+process.stdout.write('\na page left over from a replaced process reloads itself\n')
+{
+  // The page outlives the harness by design (that is why the lamp probes the
+  // control agent directly), so after a restart the tab keeps running the shell
+  // it was loaded from and nothing on the server can tell it that. The host
+  // identity in the status document is the one signal that survives.
+  const { reloadDecision, RELOAD_GUARD_MS } = client.__internals
+  eq('the first answer is adopted', reloadDecision(null, 'boot-a', 0, 1_000), 'adopt')
+  eq('the same host answering again is not a restart', reloadDecision('boot-a', 'boot-a', 0, 1_000), 'hold')
+  eq('a different host means this page is stale', reloadDecision('boot-a', 'boot-b', 0, 1_000_000), 'reload')
+  eq('an answer without a host identity is ignored', reloadDecision('boot-a', '', 0, 1_000_000), 'hold')
+  eq('a flapping host cannot loop the tab', reloadDecision('boot-a', 'boot-b', 999_000, 1_000_000), 'hold')
+  eq('and is let through once the guard expires',
+    reloadDecision('boot-a', 'boot-b', 1_000_000 - RELOAD_GUARD_MS, 1_000_000), 'reload')
+
+  // The very first restart after this feature is installed has no recorded
+  // identity to compare against, so the page compares *ages* instead: a host
+  // that started after this document was loaded cannot be the one that served
+  // it. Without this the first restart would look like a fresh page.
+  eq('a host younger than the page means the page is stale',
+    reloadDecision(null, 'boot-b', 0, 1_000_000, 900_000, 800_000), 'reload')
+  eq('a host older than the page is simply this page\'s own host',
+    reloadDecision(null, 'boot-b', 0, 1_000_000, 700_000, 800_000), 'adopt')
+  eq('a page served while its host is still starting is not stale',
+    reloadDecision(null, 'boot-b', 0, 1_000_000, 800_500, 800_000), 'adopt')
+  eq('and the reload guard still applies to the age signal',
+    reloadDecision(null, 'boot-b', 999_000, 1_000_000, 900_000, 800_000), 'hold')
+}
+
+process.stdout.write('\nthe restart is announced where the user is already looking\n')
+{
+  const session = makeStore()
+  const local = makeStore()
+  const dom = makeDom()
+  const { exports: page } = loadClient(undefined, {
+    sessionStorage: session,
+    localStorage: local,
+    document: dom,
+  })
+  const internals = page.__internals
+  /** How many notice cards have ever been drawn, including removed ones. */
+  const cards = () => dom.nodes.filter((node) => node.id === internals.NOTICE_ID).length
+
+  ok('the per-tab keys are distinct from the browser-wide one',
+    internals.HOST_KEY !== internals.NOTICE_KEY
+    && internals.NOTICE_KEY !== internals.SEEN_KEY
+    && internals.HOST_KEY !== internals.SEEN_KEY)
+
+  const status = {
+    host: { pid: 33828, bootId: 'boot-b' },
+    lastReport: {
+      status: 'ok',
+      headline: 'DeepSeek Harness restarted as pid 33828.',
+      createdAt: new Date().toISOString(),
+      durationMs: 37485,
+      attempts: 1,
+      rolledBack: false,
+      resumed: 'resumed',
+    },
+  }
+  const notice = internals.noticeOf(status)
+  ok('the notice collapses the status document',
+    notice.pid === 33828 && notice.status === 'ok' && notice.attempts === 1, JSON.stringify(notice))
+  ok('a host with no report still yields a notice', internals.noticeOf({ host: {} }).status === 'unknown')
+  eq('sub-second durations stay in milliseconds', internals.humanDuration(480), '480 ms')
+  eq('durations read the way a human says them', internals.humanDuration(37485), '37.5 s')
+  eq('long restarts switch to minutes', internals.humanDuration(125_000), '2 min 5 s')
+  eq('a missing duration renders as nothing', internals.humanDuration(null), '')
+
+  // What a reloading tab leaves behind for its successor: the successor's first
+  // status answer already describes the *current* host, so the restart it just
+  // lived through is otherwise invisible.
+  session.setItem(internals.NOTICE_KEY, JSON.stringify(notice))
+  internals.announcePending()
+  ok('the staged notice is drawn after the reload', cards() === 1, String(cards()))
+  ok('it says the session continued by itself',
+    dom.textOf(dom.getElementById(internals.NOTICE_ID)).some((line) => line.includes('会话已自动继续')))
+  ok('it names the new process',
+    dom.textOf(dom.getElementById(internals.NOTICE_ID)).some((line) => line.includes('pid 33828')))
+  ok('the staging record is consumed', session.getItem(internals.NOTICE_KEY) === null)
+  ok('the report is marked as announced browser-wide',
+    local.getItem(internals.SEEN_KEY) === internals.signatureOf(notice),
+    String(local.getItem(internals.SEEN_KEY)))
+
+  internals.announceOnce(status)
+  ok('the same report is never announced twice', cards() === 1, String(cards()))
+
+  // The supervisor writes a provisional record before it spawns anything and
+  // overwrites it in place once the attempt settles — same id, same
+  // `createdAt`, different verdict. A card staged during that window has to be
+  // able to correct itself, or the user is left reading "restarting" forever.
+  const provisional = {
+    host: status.host,
+    lastReport: {
+      status: 'in-progress',
+      headline: 'Restart in progress: end-to-end test.',
+      createdAt: new Date(Date.now() + 500).toISOString(),
+      durationMs: null,
+      attempts: 0,
+      rolledBack: false,
+      resumed: null,
+    },
+  }
+  internals.announceOnce(provisional)
+  ok('the provisional record is announced as it stands', cards() === 2, String(cards()))
+
+  const settled = {
+    host: status.host,
+    lastReport: {
+      ...provisional.lastReport,
+      status: 'ok',
+      headline: 'DeepSeek Harness restarted as pid 33828.',
+      attempts: 2,
+      resumed: 'resumed',
+    },
+  }
+  internals.announceOnce(settled)
+  ok('a settled verdict replaces the provisional card', cards() === 3, String(cards()))
+  ok('and the card on screen is the settled one',
+    dom.textOf(dom.getElementById(internals.NOTICE_ID)).some((line) => line.includes('DeepSeek Harness restarted as pid 33828.')),
+    JSON.stringify(dom.textOf(dom.getElementById(internals.NOTICE_ID))))
+  internals.announceOnce(settled)
+  ok('the corrected card is not redrawn on every probe', cards() === 3, String(cards()))
+
+  // A tab that stayed open across the restart (nothing reloaded it), or one
+  // opened by a user who never saw the outcome.
+  const later = {
+    host: { pid: 9, bootId: 'boot-c' },
+    lastReport: {
+      status: 'rolled-back',
+      headline: 'The first boot failed; the configuration was rolled back.',
+      createdAt: new Date(Date.now() + 1_000).toISOString(),
+      durationMs: 90_000,
+      attempts: 2,
+      rolledBack: true,
+      resumed: 'failed: session log is locked',
+    },
+  }
+  internals.announceOnce(later)
+  ok('a newer report is announced on its own', cards() === 4, String(cards()))
+  const rollbackCard = dom.textOf(dom.getElementById(internals.NOTICE_ID))
+  ok('a rollback is introduced as one', rollbackCard.some((line) => line.includes('已回滚配置并重启')), JSON.stringify(rollbackCard))
+  ok('the rollback and the attempt count are shown',
+    rollbackCard.some((line) => line.includes('2 次尝试')) && rollbackCard.some((line) => line.includes('已回滚配置')))
+
+  internals.announceOnce({
+    host: {},
+    lastReport: { status: 'ok', headline: 'old news', createdAt: new Date(Date.now() - 3_600_000).toISOString() },
+  })
+  ok('yesterday\'s restart is not replayed', cards() === 4, String(cards()))
+
+  // Closing the card is the user's decision, so it has to work.
+  const card = dom.getElementById(internals.NOTICE_ID)
+  dom.body.removeChild(card)
+  ok('the card can be dismissed', dom.getElementById(internals.NOTICE_ID) === null)
+}
+
+process.stdout.write('\na hostile document cannot take the page down\n')
+{
+  // Same rule as the lamp: an exception here would run inside the host's own
+  // boot path, and losing a notice is always acceptable.
+  const session = makeStore()
+  const dom = { body: {}, createElement: () => { throw new Error('no DOM for you') } }
+  const { exports: page } = loadClient(undefined, {
+    sessionStorage: session,
+    localStorage: makeStore(),
+    document: dom,
+  })
+  session.setItem(page.__internals.NOTICE_KEY, JSON.stringify({ status: 'ok', createdAt: null }))
+  const originalWarn = console.warn
+  console.warn = () => {}
+  let threw = false
+  let drew = null
+  try {
+    drew = page.__internals.renderNotice({ status: 'ok' })
+  } catch {
+    threw = true
+  }
+  console.warn = originalWarn
+  ok('a document that refuses to create elements is contained', threw === false && drew === false)
 }
 
 process.stdout.write(`\n${checks - failures.length}/${checks} checks passed\n`)

@@ -13,6 +13,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -20,7 +21,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type {
-  AgentInfo, AgentStatus, AttemptOutcome, LaunchSpec, RestartReport, TrackedFiles,
+  AgentInfo, AgentStatus, AttemptOutcome, LaunchSpec, RestartReport, ResumeIntent, TrackedFiles,
 } from './protocol.ts'
 import { ENV_AGENT_TOKEN, ENV_AGENT_URL, ENV_ATTEMPT, ENV_WATCHDOG, STATE_VERSION } from './protocol.ts'
 import { ensureDir, isFile, listDir, makeId, nowIso, readJson, sleep, writeJsonAtomic } from './fsx.ts'
@@ -60,6 +61,20 @@ const AGENT_PROBE_TIMEOUT_MS = 5_000
 
 /** How many times that probe is repeated before the agent counts as absent. */
 const AGENT_PROBE_ATTEMPTS = 3
+
+/**
+ * How long a wake-up waits for the agent to record the restart's outcome.
+ *
+ * This boot commits startup before the supervisor has finished judging it: the
+ * agent waits out its own settle window (2.5 s by default) and only then writes
+ * the terminal report. Waking a session with "the restart is still in progress"
+ * while it is visibly running would be worse than a short wait, so the framing
+ * polls for the settled record first and gives up quietly if it never comes.
+ */
+const REPORT_SETTLE_BUDGET_MS = 8_000
+
+/** Poll interval inside that budget. */
+const REPORT_SETTLE_POLL_MS = 400
 
 /**
  * Structural view of the system-prompt service.
@@ -116,6 +131,75 @@ interface AppReadyLike {
 /** The launcher's bounded exit request. */
 type AppExitLike = (code: number) => void
 
+/**
+ * Structural view of the live agent a restart was requested from.
+ *
+ * Only the session identity is read here: everything the new boot needs to
+ * wake that session again is derived from it, not from the dying process.
+ */
+interface LiveAgentLike {
+  id?: unknown
+  session?: { id?: unknown }
+}
+
+/**
+ * Structural view of the agent registry (`ctx.agents`).
+ *
+ * The registry is the only thing that can put a *stopped* session back into a
+ * runnable state after a restart: sessions are durable, agents are not, so a
+ * fresh process has no agent for the conversation until one is resumed. The
+ * shape is declared locally like every other service here — an out-of-tree
+ * plugin must not fail to compile because an internal package was renamed.
+ */
+interface AgentsLike {
+  get(id: string): AgentLike | undefined
+  resume(options: {
+    resumeSessionId: string
+    agentOptions?: { provider: string; model: string }
+    setup?: (agentCtx: unknown, agent: unknown) => void | Promise<void>
+  }): Promise<AgentHandleLike>
+}
+
+/** Structural view of one live agent, as far as waking it is concerned. */
+interface AgentLike {
+  /** `idle` when nothing is running on it; anything else means work is in flight. */
+  status?: unknown
+  followup(message: unknown): void
+}
+
+/** The handle the registry returns for a resumed session. */
+interface AgentHandleLike {
+  agent: AgentLike
+}
+
+/** Structural view of the default-model service, the source of a resume's provider/model. */
+interface AgentDefaultModelLike {
+  currentSelection(): { provider: string; model: string }
+}
+
+/**
+ * Structural view of the agent-preset service.
+ *
+ * A session records the preset it was created under. Mounting the same one on
+ * resume is what keeps a wake-up from silently swapping the conversation's
+ * tools and system prompt for the profile defaults.
+ */
+interface AgentPresetsLike {
+  resolve(id: string | undefined): Promise<{ id: string }>
+  mount(agentCtx: unknown, id: string): Promise<void>
+}
+
+/**
+ * Structural view of the per-session projection store.
+ *
+ * Read at *request* time on purpose: the requesting process already holds the
+ * live session, so the preset can be captured without opening anything on the
+ * next boot — and a boot that cannot read it simply resumes without one.
+ */
+interface SessionProjectionsLike {
+  stateOf(session: unknown, key: string): unknown
+}
+
 /** Plugin configuration. */
 export interface Config {
   /** Master switch; `false` registers nothing and starts no agent. */
@@ -169,6 +253,43 @@ export interface Config {
   watchdog: boolean
   /** How long the watchdog waits for a replacement before starting one itself. */
   watchdogWaitMs: number
+  /**
+   * Wake the session that asked for a restart, once the new process is up.
+   *
+   * A restart ends the turn *and* the process running it, so the conversation
+   * stops mid-task: the model has written its closing line, the tree is gone,
+   * and the fresh process has no idea anything was in flight. Without this,
+   * the work only continues when the human types something — which is exactly
+   * the "go on" message this feature exists to remove.
+   *
+   * The wake-up is a plugin-sourced user message (`source.kind: 'plugin'`), so
+   * it never impersonates the user; it carries the restart report and the
+   * reason the model itself gave, and asks it to continue from where it
+   * stopped. The agent then runs a turn nobody typed a prompt for, which is
+   * the point — and the reason a profile that would rather stay quiet can turn
+   * it off.
+   */
+  resumeAfterRestart: boolean
+  /**
+   * How old a resume intent may be before a boot refuses to act on it.
+   *
+   * The intent is written by the process that is about to die, so a boot that
+   * finds one hours later is looking at a restart that was *not* what produced
+   * it (a manual start, another profile's leftover). Past this window the
+   * record is history, not an instruction, and the harness must not start a
+   * turn on its own.
+   */
+  resumeWindowMs: number
+  /**
+   * How long a wake-up waits for the supervisor to record how the restart ended.
+   *
+   * This boot commits startup *before* the supervisor has judged it: the agent
+   * waits out its own settle window and only then writes the terminal report.
+   * Zero means "speak immediately with whatever is on disk" — the framing is
+   * still accurate, it just says `in-progress`, which is the record's own word
+   * for a boot that has produced a running process.
+   */
+  resumeReportWaitMs: number
 }
 
 export const Config: z<Config> = z.object({
@@ -191,6 +312,9 @@ export const Config: z<Config> = z.object({
   agentArgs: z.array(String).default([]),
   watchdog: z.boolean().default(true),
   watchdogWaitMs: z.natural().default(120_000),
+  resumeAfterRestart: z.boolean().default(true),
+  resumeWindowMs: z.natural().default(900_000),
+  resumeReportWaitMs: z.natural().default(REPORT_SETTLE_BUDGET_MS),
 })
 
 /** The defaults, so a direct instantiation cannot read `undefined` for a knob. */
@@ -214,6 +338,9 @@ export const DEFAULTS: Config = {
   agentArgs: [],
   watchdog: true,
   watchdogWaitMs: 120_000,
+  resumeAfterRestart: true,
+  resumeWindowMs: 900_000,
+  resumeReportWaitMs: REPORT_SETTLE_BUDGET_MS,
 }
 
 /**
@@ -287,6 +414,93 @@ function agentEntry(): string {
 /** Absolute path of the bundled resurrection watchdog, next to this module. */
 function watchdogEntry(): string {
   return fileURLToPath(new URL('./watchdog.js', import.meta.url))
+}
+
+/**
+ * Wait — briefly — for the supervisor to record how this restart ended.
+ *
+ * @param paths - state paths holding the report directory.
+ * @param budgetMs - how long to keep asking.
+ * @returns the newest settled report, the newest report as-is when the budget
+ *   runs out, or undefined when there is none at all.
+ */
+async function settledReport(paths: StatePaths, budgetMs = REPORT_SETTLE_BUDGET_MS): Promise<RestartReport | undefined> {
+  const deadline = Date.now() + budgetMs
+  for (;;) {
+    const report = readLatestReport(paths)
+    if (report !== undefined && report.status !== 'in-progress') return report
+    if (Date.now() >= deadline) return report
+    await sleep(REPORT_SETTLE_POLL_MS)
+  }
+}
+
+/**
+ * Build the framing that wakes a session whose turn a restart cut in half.
+ *
+ * The shape follows the harness's own plugin framings (`schedule` reminders):
+ * a bracketed header, one sentence of standing instruction, then every dynamic
+ * value as JSON on its own line. That last part is not cosmetic — `reason` is
+ * text the model wrote before the restart, and a plugin-sourced message that
+ * inlines untrusted text as prose is how a stray instruction gets promoted to
+ * a system-level one. Quoting it keeps it data.
+ *
+ * @param intent - the claimed resume intent.
+ * @param report - the newest restart report, when one is readable.
+ * @param pid - pid of the process that is now running.
+ * @returns the model-visible message text.
+ */
+function resumeFraming(intent: ResumeIntent, report: RestartReport | undefined, pid: number): string {
+  const lines = [
+    '[RESTART RESUME]',
+    'DeepSeek Harness was restarted by its out-of-process supervisor and is running again. The user has '
+    + 'said nothing since: this turn was started automatically so the work interrupted by the restart can '
+    + 'finish. Continue from where you left off — confirm the change the restart was for is actually in '
+    + 'effect, tell the user in one or two sentences where things now stand, and complete the remaining '
+    + 'work. Do not request another restart unless something is genuinely still broken.',
+    `restart_status_json: ${JSON.stringify(report?.status ?? 'unknown')}`,
+    `restart_headline_json: ${JSON.stringify(report?.headline ?? '')}`,
+    `restart_reason_json: ${JSON.stringify(intent.reason)}`,
+    `requested_at: ${intent.requestedAt}`,
+    `running_pid: ${String(pid)}`,
+  ]
+  if (report !== undefined && report.attempts.length > 0) {
+    lines.push(`restart_attempts: ${String(report.attempts.length)}`)
+  }
+  if (report?.rollback?.performed === true) {
+    lines.push('restart_rolled_back_configuration: true')
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Build one plugin-sourced user message.
+ *
+ * `@deepseek-ai/dsh-llm` owns the message shape (identity plus a deep-frozen
+ * body), so it is preferred when it resolves — but it is imported lazily and
+ * with a fallback, because a resume is a convenience and a module that fails
+ * to load at plugin-apply time would take the whole harness down with it.
+ *
+ * @param text - model-visible content.
+ * @returns the message object `followup` accepts.
+ */
+async function pluginUserMessage(text: string): Promise<unknown> {
+  const content = [{ type: 'text', text }]
+  const source = { kind: 'plugin', plugin: name }
+  try {
+    // Assembled at runtime on purpose: this plugin declares no dependency on
+    // the harness's private packages (see the module comment at the top), and a
+    // literal specifier would turn a renamed internal package into a build
+    // failure instead of one degraded convenience.
+    const specifier = ['@deepseek-ai', 'dsh-llm'].join('/')
+    const mod = await import(specifier) as { createUserMessage?: (input: unknown) => unknown }
+    if (typeof mod.createUserMessage === 'function') return mod.createUserMessage({ content, source })
+  } catch (error) {
+    process.stderr.write(
+      `[${name}] the message factory is unavailable (${error instanceof Error ? error.message : String(error)}); `
+      + 'falling back to a plain user message\n',
+    )
+  }
+  return { id: randomUUID(), role: 'user', content, source }
 }
 
 /** Read the mounted profile directory from the Loader's base URL. */
@@ -577,6 +791,195 @@ export function apply(ctx: Context, config: Config): void {
     }
   })
 
+  // ── resume intent ───────────────────────────────────────────────────────
+
+  /**
+   * Read the agent preset a live session is running under.
+   *
+   * Best-effort by construction: the projection store may not be mounted, may
+   * not carry the key, or may throw on a session it does not know. Every one of
+   * those simply means "no preset recorded", and the resume falls back to the
+   * profile defaults — which is exactly what a session created under the
+   * default preset would have used anyway.
+   *
+   * @param session - the live session the restart was requested from.
+   * @returns the preset id, or undefined when it cannot be read.
+   */
+  const agentPresetOf = (session: unknown): string | undefined => {
+    if (session === undefined || session === null) return undefined
+    try {
+      const projections = ctx.get('sessionProjections') as SessionProjectionsLike | undefined
+      const value = projections?.stateOf(session, 'agentPreset')
+      return typeof value === 'string' && value.length > 0 ? value : undefined
+    } catch (error) {
+      log(`could not read the session's agent preset: ${error instanceof Error ? error.message : String(error)}`)
+      return undefined
+    }
+  }
+
+  /**
+   * Record that a session asked for the restart now being scheduled.
+   *
+   * Written by the process that is about to die, because it is the only one
+   * that knows which conversation requested this. The boot that replaces it
+   * reads the record and wakes that session, which is what turns "the user has
+   * to say go on" into "the work simply continues".
+   *
+   * Failure here is logged and swallowed: a restart that cannot be resumed is
+   * still a restart that must happen.
+   *
+   * @param sessionId - session the request came from, when the tool had one.
+   * @param reason - the model's own reason for the restart (untrusted text).
+   * @param session - the live session object, for the preset lookup.
+   */
+  const rememberResumeIntent = (sessionId: string | undefined, reason: string, session: unknown): void => {
+    if (!resolved.resumeAfterRestart) return
+    if (sessionId === undefined || sessionId.length === 0) {
+      log('the restart was requested outside a session; there is nothing to resume')
+      return
+    }
+    try {
+      const preset = agentPresetOf(session)
+      const intent: ResumeIntent = {
+        version: STATE_VERSION,
+        sessionId,
+        cwd: process.cwd(),
+        reason,
+        requestedAt: nowIso(),
+        fromPid: process.pid,
+        instance: instance.key,
+        ...(preset === undefined ? {} : { agentPreset: preset }),
+      }
+      writeJsonAtomic(instance.resumeIntent, intent)
+      log(`recorded a resume intent for session ${sessionId}: the next boot wakes it`)
+    } catch (error) {
+      log(`could not record the resume intent: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  /** Write the claim's outcome back, so the record says what the wake-up did. */
+  const settleResumeIntent = (intent: ResumeIntent, outcome: string): void => {
+    try {
+      writeJsonAtomic(instance.resumeIntent, { ...intent, outcome } satisfies ResumeIntent)
+    } catch (error) {
+      log(`could not record the resume outcome: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  /**
+   * Wake the session whose turn the restart cut in half.
+   *
+   * Runs once, on the committed-startup signal, and is deliberately paranoid:
+   * every reason not to act (disabled, another instance's record, already
+   * claimed, too old, the session already live, no agent registry) ends in a
+   * log line and a return. Nothing here may throw — this executes inside the
+   * boot path of a process that has just proven it can start, and a
+   * convenience feature is not allowed to put that at risk.
+   */
+  const resumeInterruptedSession = async (): Promise<void> => {
+    if (!resolved.resumeAfterRestart) return
+    const intent = readJson<ResumeIntent>(instance.resumeIntent)
+    if (intent === undefined || intent.consumedAt !== undefined) return
+    if (intent.instance !== instance.key) {
+      log(`the resume intent belongs to instance ${intent.instance}; leaving it alone`)
+      return
+    }
+    const age = Date.now() - Date.parse(intent.requestedAt)
+    if (!Number.isFinite(age) || age > resolved.resumeWindowMs) {
+      log(`the resume intent for session ${intent.sessionId} is stale (${String(Math.round(age / 1000))} s); `
+        + 'it does not describe a restart that produced this boot')
+      return
+    }
+    // Claim first: whatever happens next, this intent can never wake a session
+    // twice. A crash between here and the followup therefore loses one wake-up,
+    // which is the failure this feature is allowed to have.
+    const claimed: ResumeIntent = { ...intent, consumedAt: nowIso() }
+    try {
+      writeJsonAtomic(instance.resumeIntent, claimed)
+    } catch (error) {
+      log(`could not claim the resume intent: ${error instanceof Error ? error.message : String(error)}`)
+      return
+    }
+
+    const agents = ctx.get('agents') as AgentsLike | undefined
+    if (agents === undefined) {
+      settleResumeIntent(claimed, 'skipped: no agent registry is mounted')
+      log(`session ${intent.sessionId} asked for this restart, but no agent registry is mounted to wake it`)
+      return
+    }
+
+    /**
+     * Queue the wake-up on one live agent.
+     *
+     * @param agent - the agent that owns the session.
+     * @param how - what the log should call this.
+     */
+    const wake = async (agent: AgentLike, how: string): Promise<void> => {
+      const report = await settledReport(paths, resolved.resumeReportWaitMs)
+      agent.followup(await pluginUserMessage(resumeFraming(intent, report, process.pid)))
+      settleResumeIntent(claimed, 'resumed')
+      log(`resumed session ${intent.sessionId} (${how}): the interrupted task continues without a prompt`)
+    }
+
+    // The browser reconnects to its session on its own schedule, and the API it
+    // talks to resumes an agent for a session it does not find live. Whoever
+    // gets there first, the session ends up with one agent — so an existing one
+    // is not a reason to give up, it is the thing to wake. Only a busy agent is
+    // left alone: it means somebody is already driving this conversation.
+    const existing = agents.get(intent.sessionId)
+    if (existing !== undefined) {
+      if (existing.status !== undefined && existing.status !== 'idle') {
+        settleResumeIntent(claimed, 'skipped: the session is already running a turn')
+        log(`session ${intent.sessionId} is already running; leaving its turn alone`)
+        return
+      }
+      try {
+        await wake(existing, 'already live')
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error)
+        settleResumeIntent(claimed, `failed: ${detail}`)
+        log(`could not wake session ${intent.sessionId}: ${detail}`)
+      }
+      return
+    }
+
+    // The preset the session was created under, mounted again so the wake-up
+    // keeps the conversation's own tools and system prompt.
+    let setup: ((agentCtx: unknown, agent: unknown) => Promise<void>) | undefined
+    const presets = ctx.get('agentPresets') as AgentPresetsLike | undefined
+    if (presets !== undefined && intent.agentPreset !== undefined) {
+      const presetId = intent.agentPreset
+      setup = async (agentCtx: unknown): Promise<void> => {
+        const preset = await presets.resolve(presetId)
+        await presets.mount(agentCtx, preset.id)
+      }
+    }
+
+    let agentOptions: { provider: string; model: string } | undefined
+    try {
+      const selected = (ctx.get('agentDefaultModel') as AgentDefaultModelLike | undefined)?.currentSelection()
+      if (selected !== undefined
+        && typeof selected.provider === 'string' && typeof selected.model === 'string') {
+        agentOptions = { provider: selected.provider, model: selected.model }
+      }
+    } catch (error) {
+      log(`could not read the default model selection: ${error instanceof Error ? error.message : String(error)}`)
+    }
+
+    try {
+      const handle = await agents.resume({
+        resumeSessionId: intent.sessionId,
+        ...(agentOptions === undefined ? {} : { agentOptions }),
+        ...(setup === undefined ? {} : { setup }),
+      })
+      await wake(handle.agent, 'resumed')
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      settleResumeIntent(claimed, `failed: ${detail}`)
+      log(`could not resume session ${intent.sessionId}: ${detail}`)
+    }
+  }
+
   /**
    * Arm the resurrection watchdog for the restart this process is about to leave behind.
    *
@@ -760,12 +1163,20 @@ export function apply(ctx: Context, config: Config): void {
       },
       render: (_args, value) => [{ type: 'text', text: String((value as { message?: unknown }).message ?? '') }],
     },
-    async execute(args) {
+    async execute(args, exec) {
+      // The session behind this call is the one whose turn the restart ends, so
+      // it is also the one the new process must wake. Read before the request:
+      // after it is accepted the process starts counting down to its own exit.
+      const live = (exec as unknown as { agent?: LiveAgentLike } | undefined)?.agent
+      const sessionId = typeof live?.session?.id === 'string' && live.session.id.length > 0
+        ? live.session.id
+        : undefined
       const result = await requestRestart({
         reason: args.reason,
         rollback: args.mode === 'rollback',
         requestedBy: 'tool',
       })
+      if (result.accepted) rememberResumeIntent(sessionId, args.reason, live?.session)
       return {
         accepted: result.accepted,
         agentUrl: agent?.url ?? '',
@@ -874,6 +1285,10 @@ export function apply(ctx: Context, config: Config): void {
     // reconciliation above may still be closing an interrupted record, and a
     // record surfaced after this point must not be surfaced again next boot.
     void deliverySettled.then(() => { markReportsDelivered(paths, pending) })
+    // Wake the session this restart was requested from. Detached from the boot
+    // path on purpose: it starts a model turn, and nothing about that may delay
+    // or endanger the startup this process just committed.
+    void resumeInterruptedSession()
   }
   const ready = ctx.get('appReady') as AppReadyLike | undefined
   if (ready !== undefined) ready.onReady(completeBoot)
@@ -897,13 +1312,40 @@ export function apply(ctx: Context, config: Config): void {
           const latest = readLatestReport(paths)
           const body = JSON.stringify({
             instance: instance.key,
+            // This process's own identity. The sidebar lamp compares it across
+            // polls: a different value means the page is talking to a process
+            // that replaced the one it was loaded from, which is the one
+            // reliable trigger for reloading itself (the page outlives the
+            // harness by design, so nothing else can tell it).
+            host: {
+              pid: process.pid,
+              bootId: launchSpec.launchId,
+              startedAt: launchSpec.startedAt,
+            },
             agent: agent === undefined
               ? null
               : { url: agent.url, pid: agent.pid, startedAt: agent.startedAt },
             lastGood: readBaselineManifest(instance.lastGood)?.createdAt ?? null,
             lastReport: latest === undefined
               ? null
-              : { status: latest.status, headline: latest.headline, createdAt: latest.createdAt },
+              : {
+                id: latest.id,
+                status: latest.status,
+                headline: latest.headline,
+                createdAt: latest.createdAt,
+                reason: latest.reason,
+                requestedBy: latest.requestedBy,
+                attempts: latest.attempts.length,
+                // Wall-clock time the restart took: the span from the request
+                // to the last attempt settling, which is what "how long was I
+                // waiting" means to whoever is looking at the page.
+                durationMs: latest.attempts.length === 0
+                  ? null
+                  : Math.max(0, Date.parse(latest.attempts[latest.attempts.length - 1]!.finishedAt)
+                    - Date.parse(latest.createdAt)),
+                rolledBack: latest.rollback?.performed === true,
+                resumed: readJson<ResumeIntent>(instance.resumeIntent)?.outcome ?? null,
+              },
           })
           response.writeHead(200, {
             'content-type': 'application/json; charset=utf-8',

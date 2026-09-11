@@ -75,12 +75,19 @@ node --import tsx/esm apps/cli/src/bin.ts plugin --profile web remove dsh-restar
 这一条是必须的：重启请求本来就发生在**一轮对话中间**，如果按定时器退出，模型的收尾回复会被拦腰砍断，
 重启完回来看到的就是"对话没继续"。
 
-### 重启后的两个行为
+### 重启后的三个行为
 
 - **Web 面不会又弹一个浏览器标签页**：受管重启时会在命令行末尾追加 `--no-open`（只在检测到 Web 面已挂载时才加，
   这样 tui / headless 之类的 profile 不会因为不认识的参数起不来）。你本来就在看着要重启的那个页面。
 - **重启结果会回到会话里**：新实例启动时读取上一次的重启报告，打进 stderr、注册成系统提示词里的一段，
   并可通过 `dsh_restart_status` 复查。
+- **任务自己接着跑，页面自己回来**（默认开）：重启会同时结束这一轮对话和跑它的进程，以前的结果是
+  "你得像催一下才继续" —— 现在不用了：
+  - 宿主半边在受理重启时记下**是哪个会话要的重启**，新进程启动提交后把那个会话唤醒
+    （`ctx.agents.resume` + 一条 `source.kind: 'plugin'` 的消息），模型从中断处继续干活；
+  - 浏览器半边每 3 秒问一次宿主的身份，一旦发现回答的**已经不是加载这个页面的那个进程**，
+    就自动刷新自己，并在右下角弹一张重启结果卡片（状态 / 耗时 / pid / 报告摘要）。
+  详见 [DESIGN.md](DESIGN.md) 第 12 节。想关掉就配 `resumeAfterRestart: false`。
 
 ### 2. 查状态
 
@@ -244,6 +251,8 @@ Agent 在**每次拉起进程之前**先把报告写到 `reports/<id>.json`（�
     trackedDirectories: []  # 额外要跟踪的目录（一层深，跳过 node_modules）
     idleExitMs: 1800000     # Agent 空转多久后自己退出
     exposeWebRoute: true    # 暴露 GET /api/dsh-restart/status
+    resumeAfterRestart: true# 重启后唤醒提出请求的会话，让任务自己接着跑
+    resumeWindowMs: 900000  # 续跑意图的有效期（超过就当历史记录，不再自动开一轮）
 ```
 
 ## 状态目录
@@ -259,6 +268,7 @@ dsh-restart/
 └── instances/<key>/              # 每个 DSH 实例一份，互不干扰
     ├── launch.json               # 原样重启所需的 argv / cwd / env
     ├── tracked-files.json        # 该实例跟踪哪些配置
+    ├── resume.json               # 这次重启是哪个会话提的（新进程据此唤醒它）
     └── last-good/                # 回滚基线（manifest.json + files/）
 ```
 

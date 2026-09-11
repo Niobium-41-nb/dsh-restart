@@ -343,7 +343,114 @@ Agent 被自己那条命令杀掉：
 - **不持久化 Agent 的 PID 语义**：`agent.json` 只是缓存，任何时刻都以 `/health` 探测为准；
   Agent 可以随时被 `idleExitMs` 收走，下次需要时再拉起来。
 
-## 11. 测试策略
+## 11. 重启之后：会话自己接着跑，页面自己回来
+
+这一节的需求是一句用户原话：
+
+> 重启后 deepseek-harness 无法自动继续任务，需要人工提醒。希望你可以实现自动化。
+
+两件事以前都要人做，而且都不该由人做：
+
+1. **发一条消息**才有人接着干活；
+2. **手动刷新浏览器**才能看到新进程。
+
+### 11.1 为什么重启之后必然停住
+
+Dsh 的会话是**持久化**的（JSONL），代理是**进程内**的 —— 进程没了，那个会话在当前进程里就
+**没有代理**。重启又恰好是"一轮对话 + 跑它的进程"同时结束：模型写完收尾回复，树倒下，
+新进程对整个在途任务一无所知。于是唯一的续跑途径就是**人再发一条消息**——
+而那条消息恰好是"继续"两个字，信息量为零。
+
+报告那条路（第 7.1 节）解决不了它：报告只进入**系统提示词**，而系统提示词只有在下一次有人说话时
+才会被读。没有人说话，报告就一直躺在那里。
+
+### 11.2 意图由将死的进程写，由新生的进程兑现
+
+唤醒需要两个只有不同进程才知道的事实：**是哪个会话**要的重启（只有旧进程知道），
+和**怎么把一个停掉的会话变回可运行的代理**（只有新进程能做）。
+
+```
+旧进程（受理重启时）                     新进程（启动提交后）
+  dsh_restart 工具拿到 exec.agent          读 instances/<key>/resume.json
+        │  session.id                            │  过期？不是本实例？已认领？→ 不动
+        ▼                                         ▼
+  写 resume.json                           先写 consumedAt 认领
+  {sessionId, reason, requestedAt,         再 ctx.agents.resume({resumeSessionId, agentOptions, setup})
+   fromPid, instance, agentPreset}         再 agent.followup(插件来源的用户消息)
+```
+
+`ctx.agents.resume` 是 harness 自己的路径（Web 面点开会话时走的就是它），它负责打开会话日志、
+修补被中断的回合、发布会话、起循环。`setup` 里重新挂载会话原本的 **agent preset** ——
+否则一次唤醒会把会话的工具集和系统提示词悄悄换成 profile 默认值。
+
+四条护栏，每一条都对着一个真实的坏结果：
+
+| 护栏 | 不做会怎样 |
+|---|---|
+| **先认领再唤醒**（写 `consumedAt`） | 中途崩一次就会在下次启动再唤醒一遍，同一个任务跑两遍 |
+| **新鲜度窗口**（`resumeWindowMs`，默认 15 分钟） | 手工启动 DSH 时读到昨天的意图，**没人要求**就开始烧 token |
+| **已在线就唤醒它，而不是再起一个** | 浏览器可能比插件先接上会话（它自己也会 `resume`）：那样 `resume` 会撞上写锁，于是"什么都没发生"。**空闲**的在线代理直接 `followup`；正在跑回合的才跳过（有人在开这辆车） |
+| **等判决再说话**（`resumeReportWaitMs`，默认 8 秒） | boot 提交时监督者还没判完这一轮（它要等 2.5 秒的 settle），说出口的就是"重启进行中" |
+| **失败只记日志** | 它跑在"刚刚证明自己能启动"的进程里，一个便利功能不允许把这次启动弄坏 |
+
+### 11.3 唤醒消息不能被当成用户说的话
+
+唤醒用的是一条 **`source.kind: 'plugin'`** 的用户消息，不是伪造的用户输入 —— 会话记录里能看出
+它不是人打的。文本按 harness 自己的插件框架写法组织（参考 `schedule` 的提醒）：
+
+```
+[RESTART RESUME]
+DeepSeek Harness was restarted by its out-of-process supervisor … Continue from where you left off …
+restart_status_json: "ok"
+restart_headline_json: "…"
+restart_reason_json: "installed a plugin"     ← 模型自己写过的文本，按数据引用
+running_pid: 33828
+```
+
+`reason` 是模型在重启前写下的**不可信文本**。把它当散文嵌进消息里，就等于让一段旧文本升级成
+指令；所以它只以 JSON 字符串出现（和 `schedule` 处理 `reminder_prompt` 是同一个道理）。
+
+消息对象优先由 `@deepseek-ai/dsh-llm` 的 `createUserMessage` 造（身份 + 冻结），但它是**动态
+import 且带退路**的：这个插件刻意不依赖 harness 的私有包（见文件头注释），一个模块解析失败不该
+让整棵树起不来 —— 退化成手写对象即可。同样的理由，模块名是运行时拼出来的，不是字面量。
+
+### 11.4 页面为什么必须自己刷新
+
+页面**故意**比 harness 活得久（指示灯直连 3099 就是为此），代价是：重启之后，这个标签页里跑的
+仍然是**那个已经不存在的进程**发出来的 shell。没有任何服务端手段能通知它 —— 请求会打到新进程上，
+而新进程根本不知道有这么个旧页面。
+
+唯一可靠的信号是**宿主身份在持续轮询下发生变化**。于是 `/dsh-restart/status` 增加 `host`
+（`pid` + 本次启动的 `launchId`），客户端每 3 秒比一次：
+
+| 观察 | 判定 |
+|---|---|
+| 第一次拿到身份 | `adopt`（记下来，什么都不做） |
+| 和记下来的一样 | `hold` |
+| 不一样（换了进程） | **先把新身份记下来**，再 `location.reload()` |
+| 15 秒内刚刷过 | `hold`（防止崩溃循环把标签页变成刷新机器） |
+
+"先记下来再刷新"这一条是必须的：不记，刷新后的新页面会拿**旧**身份去比，于是永远在刷。
+
+刷新会丢掉内存里的东西（未发送的**附件**），但**草稿文本不会丢** —— composer 的草稿是持久化的
+（`ui-conversation` 的 `contract/views.ts` 写明 "persisted; survives session switches and reloads"）。
+
+### 11.5 通知要出现在用户正在看的地方
+
+刷新之后，页面看到的第一份状态**已经**是当前宿主了，刚刚经历过的那次重启只剩磁盘上的报告。
+所以刷新前把要讲的话**存进 sessionStorage**，由新页面画出来：
+
+- 右下角一张卡片：`DSH 已重启完成` / `已回滚配置并重启` / `重启失败`（颜色跟着状态走）、
+  `pid`、**用时**、尝试次数、报告 headline、以及"会话已自动继续，无需再发一条消息"；
+- 关闭按钮，用户自己决定什么时候让它消失；
+- 用 `document.createElement` 手写，不依赖 `react-dom`（客户端 bundle 只允许 `require('react')`，
+  见硬规则 1），并且整段包在 `try/catch` 里 —— 丢一张卡片可以接受，把页面弄崩不行。
+
+两条路径都会走到同一张卡片：刚刷新过的页面读 sessionStorage 里的"待播报"，而**一直在那儿的**
+标签页（或用户事后才打开的页面）则由轮询发现"有份报告我还没播报过"（`localStorage` 记已读，
+10 分钟内的才算新闻）。
+
+## 12. 测试策略
 
 `tests/agent.e2e.mjs` 用一个**假 harness** 复现真实故障模式，不碰任何真实 DSH：
 
@@ -367,6 +474,20 @@ Agent 被自己那条命令杀掉：
 截图并断言颜色 / 文案 / 形状 / 不被侧边栏裁切。四种状态由**浏览器内拦截请求**造出来
 （拦 3099 或 `/dsh-restart/status`），因此**不需要停掉真实 Agent**，随时可跑；没有 GUI 或
 没有 Chrome 时它自己跳过。单测和字节比对曾经全绿而灯根本没出现 —— 这一层就是为那件事写的。
+
+第 11 节同样只能在这里证明：单测能钉住 `reloadDecision` 的判定，但"**这个标签页真的自己刷新了、
+刷新之后真的画出卡片了、而且没有进入刷新循环**"只有真浏览器能回答。做法是把
+`/dsh-restart/status` 的**响应体在途中改写**（CDP `Fetch` 域，response 阶段
+`fulfillRequest`）成一个 `host.bootId` 不同的文档，先把 sessionStorage 里的身份改成"重启前"，
+然后断言：哨兵变量消失（真的导航了）、新身份已记下、卡片出现且文案正确、8 秒后没有第二次刷新、
+点 × 能关掉。真实 harness、真实控制 Agent、真实会话全程不动。
+
+<br>
+
+`tests/plugin.test.mjs` 里续跑那一段（第 11.2 节）用的是**假 agents 服务**：断言 resume 拿到的
+session id / preset / provider，断言 `followup` 收到的是 `source.kind: 'plugin'` 的消息、
+`reason` 只以 JSON 出现，并把六条"不该动"的路径各测一遍（已认领 / 已在线 / 过期 / 别的实例 /
+没有会话 / resume 抛错），最后确认 `resumeAfterRestart: false` 是整个关掉的。
 
 真实 launcher 的验证在隔离的 `restart-lab` profile 上做（`@deepseek-ai/dsh-base` + 一个保活
 插件 + dsh-restart），完整跑通了：

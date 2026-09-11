@@ -79,10 +79,13 @@ class Cdp {
     this.next = 1
     this.pending = new Map()
     this.events = []
+    this.handlers = new Map()
     ws.addEventListener('message', (event) => {
       const message = JSON.parse(event.data)
       if (message.id === undefined) {
         this.events.push(message)
+        const handler = this.handlers.get(message.method)
+        if (handler !== undefined) handler(message.params ?? {}, message.sessionId)
         return
       }
       const entry = this.pending.get(message.id)
@@ -91,6 +94,11 @@ class Cdp {
       if (message.error !== undefined) entry.reject(new Error(message.error.message))
       else entry.resolve(message.result)
     })
+  }
+
+  /** Subscribe to one CDP event (used to rewrite responses mid-flight). */
+  on(method, handler) {
+    this.handlers.set(method, handler)
   }
 
   send(method, params = {}, sessionId) {
@@ -292,6 +300,120 @@ async function main() {
     ok('the dot is dot-sized', settled.size === '8pxx8px', settled.size)
     ok('the lamp reports the last restart in its tooltip',
       typeof settled.title === 'string' && settled.title.includes('最近一次重启'), settled.title)
+
+    // ── automatic recovery ────────────────────────────────────────────────
+    //
+    // The two things a human used to have to do after a restart: notice it
+    // happened, and reload the page. Both are driven from inside the browser
+    // (nothing on the server can reach a page that outlived it), so both can
+    // only be proven here: the unit tests pin the decision function, this
+    // proves that the tab actually navigates and then draws the notice.
+    //
+    // The restart is simulated by REWRITING the status response in flight, so
+    // the real harness, the real control agent, and the running session are
+    // all untouched.
+    process.stdout.write('\nautomatic recovery, in a real browser\n')
+    {
+      const stagedStatus = {
+        instance: 'e2e',
+        host: { pid: 4242, bootId: 'boot-after-restart', startedAt: new Date().toISOString() },
+        agent: null,
+        lastGood: null,
+        lastReport: {
+          id: 'restart-e2e',
+          status: 'ok',
+          headline: 'DeepSeek Harness restarted as pid 4242 (end-to-end test).',
+          createdAt: new Date().toISOString(),
+          reason: 'end-to-end test',
+          requestedBy: 'tool',
+          attempts: 1,
+          durationMs: 37_485,
+          rolledBack: false,
+          resumed: 'resumed',
+        },
+      }
+      cdp.on('Fetch.requestPaused', (params) => {
+        void cdp.send('Fetch.fulfillRequest', {
+          requestId: params.requestId,
+          responseCode: 200,
+          responseHeaders: [
+            { name: 'content-type', value: 'application/json; charset=utf-8' },
+            { name: 'cache-control', value: 'no-store' },
+          ],
+          body: Buffer.from(JSON.stringify(stagedStatus), 'utf8').toString('base64'),
+        }, sessionId)
+      })
+      await cdp.send('Fetch.enable', {
+        patterns: [{ urlPattern: '*dsh-restart/status*', requestStage: 'Response' }],
+      }, sessionId)
+
+      // What this tab would look like if it had been loaded from the process
+      // the restart replaced — plus a sentinel a reload necessarily destroys.
+      await cdp.send('Runtime.evaluate', {
+        expression: `(() => {
+          sessionStorage.setItem('dsh-restart.host', 'boot-before-restart');
+          sessionStorage.removeItem('dsh-restart.reloaded-at');
+          sessionStorage.removeItem('dsh-restart.notice');
+          window.__dshRestartSentinel = 'before';
+          return true
+        })()`,
+        returnByValue: true,
+      }, sessionId)
+
+      // The lamp re-probes every 3s: two cycles to notice and navigate.
+      await sleep(9_000)
+      const afterReload = await cdp.send('Runtime.evaluate', {
+        expression: `({
+          sentinel: window.__dshRestartSentinel ?? null,
+          notice: (() => {
+            const el = document.getElementById('dsh-restart-notice')
+            return el === null ? null : el.textContent
+          })(),
+          host: sessionStorage.getItem('dsh-restart.host'),
+          staged: sessionStorage.getItem('dsh-restart.notice'),
+        })`,
+        returnByValue: true,
+      }, sessionId)
+      const view = afterReload.result.value
+      const shot = await cdp.send('Page.captureScreenshot', { format: 'png' }, sessionId)
+      writeFileSync(join(shotDir, 'restart-notice.png'), Buffer.from(shot.data, 'base64'))
+
+      ok('the tab reloads itself when a different process answers',
+        view.sentinel === null, `sentinel ${String(view.sentinel)}`)
+      ok('the reload adopts the new host', view.host === 'boot-after-restart', String(view.host))
+      ok('the staged notice is consumed by the reload', view.staged === null, String(view.staged))
+      ok('the restart notice is drawn on the new page', typeof view.notice === 'string', String(view.notice))
+      ok('it names the new process and what happened',
+        typeof view.notice === 'string' && view.notice.includes('4242') && view.notice.includes('已重启完成'),
+        String(view.notice))
+      ok('it reports the time the restart took',
+        typeof view.notice === 'string' && view.notice.includes('37.5 s'), String(view.notice))
+      ok('it says the work continued by itself',
+        typeof view.notice === 'string' && view.notice.includes('会话已自动继续'), String(view.notice))
+
+      // Exactly one reload: the guard must hold across a full probe cycle, or a
+      // restarting harness would put the tab in a reload loop.
+      await cdp.send('Runtime.evaluate', { expression: `window.__dshNoLoop = 'alive'`, returnByValue: true }, sessionId)
+      await sleep(8_000)
+      const looped = await cdp.send('Runtime.evaluate',
+        { expression: `window.__dshNoLoop ?? null`, returnByValue: true }, sessionId)
+      ok('the page does not reload again on later probes', looped.result.value === 'alive', String(looped.result.value))
+
+      const dismissed = await cdp.send('Runtime.evaluate', {
+        expression: `(() => {
+          const el = document.getElementById('dsh-restart-notice')
+          if (el === null) return 'missing'
+          const button = el.querySelector('button')
+          if (button === null) return 'no button'
+          button.click()
+          return document.getElementById('dsh-restart-notice') === null ? 'gone' : 'still there'
+        })()`,
+        returnByValue: true,
+      }, sessionId)
+      ok('the notice is the user\'s to dismiss', dismissed.result.value === 'gone', String(dismissed.result.value))
+
+      await cdp.send('Fetch.disable', {}, sessionId)
+    }
 
     ws.close()
   } finally {

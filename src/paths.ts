@@ -70,6 +70,12 @@ export interface InstancePaths {
   launchSpec: string
   trackedFiles: string
   lastGood: string
+  /**
+   * The session this instance's last restart was asked for by, so the process
+   * that boots in its place can wake that session and let the interrupted work
+   * finish without a human typing anything.
+   */
+  resumeIntent: string
 }
 
 /**
@@ -102,6 +108,7 @@ export function instancePaths(root: string, key: string): InstancePaths {
     launchSpec: join(dir, 'launch.json'),
     trackedFiles: join(dir, 'tracked-files.json'),
     lastGood: join(dir, 'last-good'),
+    resumeIntent: join(dir, 'resume.json'),
   }
 }
 
