@@ -55,22 +55,39 @@ warning，于是"没有灯"看起来和"灯坏了"一样安静。
 
 ## P1 — 健壮性：把"Agent 中途死亡"这条路的损失降到最低
 
-### 1.1 中断重启的自动对账（推荐先做）
+### 1.1 中断重启的自动对账 —— ✅ 已完成（2026-09-11）
 
 **问题**：`agent.log` 停在 `forcing termination`、报告永停 `in-progress`、`attempts` 为空 ——
-这就是"Agent 在启动新进程之前死了，dsh 被留在停止状态"。目前只能靠人去看文件才发现。
+这就是"Agent 在启动新进程之前死了，dsh 被留在停止状态"。以前只能靠人去看文件才发现。
 
-**做法**：插件在 `apply` 阶段检查最新一份报告：
-若 `status === 'in-progress'` **且 `attempts.length === 0`** **且 Agent 不忙**，
-判定上次重启被中断，把它补成终态（`failed`，headline 写"上次重启在启动新进程前中断，
-dsh 曾被留在停止状态"），并在启动日志里明说。
+**做法（已实现）**：boot 阶段检测候选记录 —— `in-progress` **且** `attempts.length === 0`
+**且本进程没有 `DSH_RESTART_ATTEMPT`**（有它就说明这次启动是 Agent 拉起来的，重启没有"中断在
+spawn 之前"）—— 然后**先问 Agent**：能问到且 `busy === false`、且它手上的最新报告就是这一份，
+就把记录补成终态 `failed`（headline 说明"上一个重启在启动任何进程之前就中断了，DSH 一直停着"，
+`error` 写明判定依据），日志明说，并让这份报告照常在本轮投递给模型
+（`reportText` 对 `in-progress` 会写"你就是被重启出来的那个实例"——对中断记录恰恰是错的）。
 
-**坑**：正常重启时 boot 阶段读到 `in-progress` 是**预期的**（报告先于 spawn 写），
-所以判定必须带 `attempts.length === 0` 这个条件，且要在 Agent 可用时先问一句 `/status` 的 `busy`。
-不要只按时间判断。
+**判定条件为什么是这几条**（每条都对着一个真实误判面）：
+- `attempts` 只在**尝试结算时**追加，所以"空 attempts"本身证明不了任何事 —— 正常重启中，
+  被它拉起来的那个进程读到的就是这个形状；分隔两者的是环境变量与 `busy`。
+- Agent 问不到（例如 `autoStartAgent: false` 又没有 Agent 在跑）时是"问不出来"，不是"没在跑"：
+  **保持原样**，只记一行日志。宁可漏一次，也不能把正在跑的重启判死。
+- 关闭只发生在 `deliverReports` 打开时（关掉投递的人要的是"别在启动路径里动手"）。
 
-**验收**：从上一次中断留下的状态启动，报告被补成终态且日志有明确提示；
-正常重启路径不受影响（`in-progress` 仍被正常投递）。
+**验收证据**：
+- `tests/plugin.test.mjs` 新增 14 项（15 → 29）：关闭、忙碌不关闭、`DSH_RESTART_ATTEMPT` 不关闭、
+  有 attempt 不关闭、问不到不关闭、终态不关闭；控制 Agent 是**真实 HTTP 服务**，判定是隔着网络断言的。
+- **隔离 lab profile 实测**（`restart-lab`：base + 保活 + 一个假 Agent 回答 `/status`，`autoStartAgent: false`
+  以免真的拉起守护；报告预置成 `in-progress` + 空 attempts）：boot 后报告落成
+  `status: "failed"` + headline/error，stderr 打印
+  `closed interrupted restart …: it was left 'in-progress' with no attempts and no restart is running`，
+  系统提示词的报告段也拿到了终态文本。用完即删，无残留进程。
+
+**顺带查出一个真问题（已修）**：boot 阶段的 1.5 秒存活探测**会输给启动时的模块编译**。
+lab 里同一个配置连跑 4 次全失败（日志里是"no control agent answers"），而只要在插件前面多插一个
+插件就 6 次全成功 —— 探测被压在进程最忙的那一刻。于是对账时改成**最多问 3 次**（每次 5 秒预算、
+间隔 500ms），并把"问不到"与"没在跑"分开。修完在同一个曾经必败的配置下连跑即通过。
+代价：只有在**已经是候选记录**时才付这几秒，正常启动路径完全不受影响。
 
 ### 1.2 优雅路径的复活看门狗
 

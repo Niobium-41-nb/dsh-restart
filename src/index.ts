@@ -47,6 +47,18 @@ const REPORT_SECTION_ORDER = 10_050
 const MAX_DELIVERED_REPORTS = 3
 
 /**
+ * Budget for asking a *known* agent for its status during boot reconciliation.
+ *
+ * Larger than the 1.5s liveness probe used elsewhere on purpose: that probe is
+ * issued at the busiest moment of the process (every module is still being
+ * compiled), see {@link closeAbandonedReport}.
+ */
+const RECONCILE_STATUS_TIMEOUT_MS = 5_000
+
+/** How many times boot reconciliation retries the question before giving up. */
+const RECONCILE_ATTEMPTS = 3
+
+/**
  * Structural view of the system-prompt service.
  *
  * Declared locally on purpose: an out-of-tree plugin should not have to track
@@ -427,19 +439,20 @@ export function apply(ctx: Context, config: Config): void {
   })
 
   // ── report delivery ─────────────────────────────────────────────────────
-  const pending = resolved.deliverReports ? readPendingReports(paths) : []
-  for (const report of pending) {
-    process.stderr.write(`[dsh-restart] previous restart ${report.id}: [${report.status}] ${report.headline}\n`)
-    for (const attempt of report.attempts) {
-      if (attempt.result === 'ready' || attempt.result === 'ready-unconfirmed') continue
-      process.stderr.write(`[dsh-restart]   attempt ${String(attempt.attempt)} log: ${attempt.logFile}\n`)
+  /** Print and publish the reports this boot is responsible for surfacing. */
+  const surfaceReports = (reports: readonly RestartReport[]): void => {
+    for (const report of reports) {
+      process.stderr.write(`[dsh-restart] previous restart ${report.id}: [${report.status}] ${report.headline}\n`)
+      for (const attempt of report.attempts) {
+        if (attempt.result === 'ready' || attempt.result === 'ready-unconfirmed') continue
+        process.stderr.write(`[dsh-restart]   attempt ${String(attempt.attempt)} log: ${attempt.logFile}\n`)
+      }
     }
-  }
-  if (pending.length > 0 && resolved.promptSection) {
+    if (reports.length === 0 || !resolved.promptSection) return
     ctx.inject(['systemPrompt'], (scope) => {
       const systemPrompt = (scope as unknown as { systemPrompt?: SystemPromptLike }).systemPrompt
       if (systemPrompt === undefined) {
-        log(`no system-prompt service is mounted; ${String(pending.length)} report(s) stay tool-visible only`)
+        log(`no system-prompt service is mounted; ${String(reports.length)} report(s) stay tool-visible only`)
         return
       }
       systemPrompt.section({
@@ -452,12 +465,53 @@ export function apply(ctx: Context, config: Config): void {
           + 'Treat it as authoritative operational history: any listed file was rolled back, so what is on disk '
           + 'now is the last known-good configuration rather than the failed attempt.',
           '',
-          ...pending.map(reportText),
+          ...reports.map(reportText),
         ].join('\n'),
       })
-      log(`surfaced ${String(pending.length)} previous restart report(s) in the system prompt`)
+      log(`surfaced ${String(reports.length)} previous restart report(s) in the system prompt`)
     })
   }
+
+  // A restart that died between recording the request and spawning anything
+  // leaves an `in-progress` record that would otherwise be surfaced forever —
+  // and `reportText` would tell the model it is the restarted instance, which is
+  // the one thing it is not. Reconciliation therefore has to finish BEFORE the
+  // reports are read.
+  const pending: RestartReport[] = []
+  const abandoned = resolved.deliverReports ? abandonedReport(readLatestReport(paths)) : undefined
+  const deliverySettled: Promise<void> = abandoned === undefined
+    ? ((): Promise<void> => {
+      if (resolved.deliverReports) pending.push(...readPendingReports(paths))
+      surfaceReports(pending)
+      return Promise.resolve()
+    })()
+    : closeAbandonedReport({
+      report: abandoned,
+      paths,
+      log,
+      status: async () => {
+        // Retried on purpose. The first probe is issued while the tree is still
+        // being compiled, and a probe that loses that race reports "no agent"
+        // for an agent that is alive and idle — measured in an isolated profile:
+        // with nothing applied before this plugin the boot probe failed on
+        // every run, and with one plugin ahead of it, never. The question is
+        // only asked when a restart is already suspected of being abandoned, so
+        // a few seconds here cost nothing and turn a silent miss into the
+        // detection this exists for.
+        for (let attempt = 1; attempt <= RECONCILE_ATTEMPTS; attempt += 1) {
+          const info = await ensureAgentHandle()
+          if (info !== undefined) {
+            const status = await fetchStatus({ info, token, timeoutMs: RECONCILE_STATUS_TIMEOUT_MS })
+            if (status !== undefined) return status
+          }
+          if (attempt < RECONCILE_ATTEMPTS) await new Promise(resolve => setTimeout(resolve, 500))
+        }
+        return undefined
+      },
+    }).then(() => {
+      pending.push(...readPendingReports(paths))
+      surfaceReports(pending)
+    })
 
   // ── restart request path ────────────────────────────────────────────────
 
@@ -736,7 +790,10 @@ export function apply(ctx: Context, config: Config): void {
       log(`could not record the surface kind: ${error instanceof Error ? error.message : String(error)}`)
     }
     void reportReady(paths, token, log)
-    markReportsDelivered(paths, pending)
+    // Reports are marked delivered only once the delivery path has settled: the
+    // reconciliation above may still be closing an interrupted record, and a
+    // record surfaced after this point must not be surfaced again next boot.
+    void deliverySettled.then(() => { markReportsDelivered(paths, pending) })
   }
   const ready = ctx.get('appReady') as AppReadyLike | undefined
   if (ready !== undefined) ready.onReady(completeBoot)
@@ -807,6 +864,91 @@ function readPendingReports(paths: StatePaths, limit = MAX_DELIVERED_REPORTS): R
     .map(fileName => readJson<RestartReport>(join(paths.reports, fileName)))
     .filter((report): report is RestartReport => report !== undefined && report.deliveredAt === undefined)
     .slice(0, limit)
+}
+
+/**
+ * Decide whether a report can only describe a restart that never happened.
+ *
+ * The supervisor writes an `in-progress` record with no attempts *before* it
+ * spawns anything, so that signature is expected while a restart is in flight —
+ * including on the boot that restart produced. What is not expected is finding
+ * it on a boot no agent started: that is the shape left behind when the agent
+ * died between recording the request and launching the harness, which leaves
+ * DSH stopped and a report that never reaches a terminal state.
+ *
+ * @param report - the newest report on disk, if any.
+ * @returns the report when it is a candidate for reconciliation.
+ */
+function abandonedReport(report: RestartReport | undefined): RestartReport | undefined {
+  if (report === undefined) return undefined
+  if (report.status !== 'in-progress') return undefined
+  // An empty `attempts` list alone proves nothing: entries are appended when an
+  // attempt *settles*, so the boot of a live restart reads exactly this shape.
+  if (report.attempts.length > 0) return undefined
+  // A process the agent spawned carries the attempt identity in its
+  // environment, so having one means the restart was not interrupted before the
+  // spawn — it produced this very process.
+  if (process.env[ENV_ATTEMPT] !== undefined) return undefined
+  return report
+}
+
+/** Options for {@link closeAbandonedReport}. */
+interface CloseAbandonedOptions {
+  report: RestartReport
+  paths: StatePaths
+  log: (line: string) => void
+  /** Ask the control agent for its status, spawning one when necessary. */
+  status: () => Promise<AgentStatus | undefined>
+}
+
+/**
+ * Close a report whose restart was interrupted before it started anything.
+ *
+ * The record is rewritten as a terminal `failed` one rather than deleted: the
+ * file is the only evidence that DSH was left stopped, and it stays undelivered
+ * so this boot surfaces it like any other report.
+ *
+ * Every guard here exists because a false positive would be worse than the bug:
+ * a running restart must never be declared dead, so the agent is asked first,
+ * and an unreachable agent means "cannot tell" rather than "not running".
+ *
+ * @param options - the candidate report, the state layout, a logger, and the
+ *   callback that reaches the control agent.
+ * @returns the closed report, or undefined when it was left alone.
+ */
+async function closeAbandonedReport(options: CloseAbandonedOptions): Promise<RestartReport | undefined> {
+  const { report, paths, log } = options
+  const status = await options.status()
+  if (status === undefined) {
+    log(`restart ${report.id} never reached a terminal state, but the control agent could not be asked `
+      + 'whether a restart is running; leaving the record alone')
+    return undefined
+  }
+  if (status.busy) {
+    log(`restart ${report.id} has no attempts yet and the control agent is restarting right now; leaving it to the agent`)
+    return undefined
+  }
+  if (status.lastReport !== undefined && status.lastReport.id !== report.id) {
+    log(`restart ${report.id} is not the agent's newest report (${status.lastReport.id}); leaving it alone`)
+    return undefined
+  }
+  const closed: RestartReport = {
+    ...report,
+    status: 'failed',
+    headline: 'The previous restart was interrupted before it started any process: the control agent stopped '
+      + 'between recording the request and launching DeepSeek Harness, which stayed stopped until it was '
+      + 'started again.',
+    error: `reconciled at boot: report ${report.id} was still 'in-progress' with no attempts while no restart `
+      + 'was running, so no process was ever spawned for it',
+  }
+  try {
+    writeJsonAtomic(join(paths.reports, `${report.id}.json`), closed)
+  } catch (error) {
+    log(`could not close interrupted restart ${report.id}: ${error instanceof Error ? error.message : String(error)}`)
+    return undefined
+  }
+  log(`closed interrupted restart ${report.id}: it was left 'in-progress' with no attempts and no restart is running`)
+  return closed
 }
 
 /** Read the most recent report regardless of delivery state. */

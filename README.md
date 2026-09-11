@@ -173,6 +173,16 @@ Agent 在**每次拉起进程之前**先把报告写到 `reports/<id>.json`（�
 
 报告被读过一次就会打上 `deliveredAt`，不会在每次启动时重复轰炸。
 
+**有一种报告不会有下文**：控制 Agent 在"记下这次重启"和"拉起新进程"之间死掉 —— 那是
+"DSH 停在停止状态"这个事故的签名。这种记录会永远停在 `in-progress`、`attempts` 为空，
+而 `reportText` 会告诉模型"你就是被重启出来的那个实例"（对这份记录恰恰是错的）。
+
+所以插件在启动时会认这个形状：**只有当本进程不是 Agent 拉起来的、记录里一次尝试都没有、
+而且问过 Agent 它并不忙**时，才把它补成终态 `failed`（headline 说明上一个重启在启动任何进程
+之前就中断了，DSH 一直停着），并在启动日志里明说。**问不到 Agent 就什么都不做** ——
+"问不出来"不等于"没在跑"，宁可漏一次也不能把正在跑的重启判死。改写而不是删除：
+那个文件是这件事唯一的证据。
+
 ## 回滚基线（last-known-good）的语义
 
 - 快照**只在一个进程真的提交了启动之后**才写（`ctx.appReady` 回调），所以基线里的配置一定是
@@ -260,7 +270,7 @@ node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit   # 类型检查
 node node_modules/typescript/bin/tsc -b tsconfig.json            # 编译到 lib/types
 node node_modules/tsdown/dist/run.mjs                            # 打包 lib/index.js + lib/agent.js
 node tests/agent.e2e.mjs                                         # 43 项：Agent 侧（假 harness + CORS 行为）
-node --experimental-strip-types tests/plugin.test.mjs            # 15 项：插件侧（假 Agent HTTP 服务）
+node --experimental-strip-types tests/plugin.test.mjs            # 29 项：插件侧（假 Agent HTTP 服务、启动对账）
 node tests/client.test.mjs                                       # 58 项：客户端指示灯（stub window + slots）
 node tests/lamp.browser.mjs                                      # 25 项：真浏览器里的四种灯态（无 GUI 时跳过）
 ```
