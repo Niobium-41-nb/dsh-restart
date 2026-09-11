@@ -20,9 +20,11 @@
  */
 
 import { createServer } from 'node:http'
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const failures = []
 let checks = 0
@@ -77,6 +79,11 @@ const agentServer = createServer((request, response) => {
 })
 await new Promise((resolve) => { agentServer.listen(0, '127.0.0.1', resolve) })
 const agentPort = agentServer.address().port
+// The control agent is always a SEPARATE process (the whole point of the
+// two-stage spawn), so the recorded identity must name one: a plugin that finds
+// its own pid recorded is looking at a corrupt record, not at a live agent.
+const fakeAgentProcess = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+
 const agentInfoFile = join(stateDir, 'agent.json')
 const writeAgentInfo = (port, pid) => {
   writeFileSync(agentInfoFile, `${JSON.stringify({
@@ -90,7 +97,7 @@ const writeAgentInfo = (port, pid) => {
     stateDir,
   }, null, 2)}\n`)
 }
-writeAgentInfo(agentPort, process.pid)
+writeAgentInfo(agentPort, fakeAgentProcess.pid)
 
 const { apply } = await import('../src/index.ts')
 
@@ -131,7 +138,15 @@ function makeHost({ web = true } = {}) {
   }
 }
 
-const SILENT = { exitDelayMs: 80, exitWaitForIdleMs: 5_000, captureEnvironment: false }
+const SILENT = {
+  exitDelayMs: 80,
+  exitWaitForIdleMs: 5_000,
+  captureEnvironment: false,
+  // Off for these cases on purpose: each one exercises the exit path, and a
+  // real watchdog process per exit would outlive the assertions. The scenario
+  // below turns it on explicitly.
+  watchdog: false,
+}
 const AGENT = { id: 'root-agent', session: { id: 'sess-1', cwd: 'E:/work' }, status: 'running' }
 
 process.stdout.write('\nrelaunch arguments\n')
@@ -351,7 +366,7 @@ process.stdout.write('\nan interrupted restart is closed at boot\n')
   ok('an unreachable agent means the record is left alone',
     read(unanswerable.file).status === 'in-progress', read(unanswerable.file).status)
   ok('and the log admits it could not tell', offline.includes('could not be asked'), 'no admission logged')
-  writeAgentInfo(agentPort, process.pid)
+  writeAgentInfo(agentPort, fakeAgentProcess.pid)
 
   // 6. A terminal report is none of this feature's business.
   const terminal = writeReport({ status: 'ok', headline: 'DeepSeek Harness restarted as pid 1.' })
@@ -360,7 +375,52 @@ process.stdout.write('\nan interrupted restart is closed at boot\n')
     read(terminal.file).status === 'ok' && read(terminal.file).headline === 'DeepSeek Harness restarted as pid 1.')
 }
 
+process.stdout.write('\nthe watchdog is armed on the way out\n')
+{
+  // The restart is only as good as the thing that finishes it: if the agent
+  // dies between accepting and spawning, this process is the only one that
+  // still knows a harness is supposed to be starting.
+  const lines = []
+  const original = process.stderr.write
+  process.stderr.write = (chunk) => { lines.push(String(chunk)); return true }
+  const host = makeHost({ web: true })
+  apply(host.ctx, { ...SILENT, watchdog: false, exitDelayMs: 40 })
+  const tool = host.tools.find(candidate => candidate.name === 'dsh_restart')
+  await tool.execute({ reason: 'unit test without a watchdog' })
+  host.emit('agent/status', { agent: AGENT, status: 'idle' })
+  await sleep(600)
+  process.stderr.write = original
+  ok('the exit still happens', host.exits.length === 1, JSON.stringify(host.exits))
+  ok('watchdog: false leaves the exit path alone', !lines.join('').includes('armed the watchdog'))
+
+  // Arming is asserted against the BUILT plugin, because the entry is resolved
+  // next to whichever module is running: from source that is `src/watchdog.js`
+  // (which does not exist — and is reported rather than guessed at), from the
+  // shipped layout it is `lib/watchdog.js`, the artifact that actually runs.
+  const builtEntry = fileURLToPath(new URL('../lib/index.js', import.meta.url))
+  if (!existsSync(builtEntry) || !existsSync(fileURLToPath(new URL('../lib/watchdog.js', import.meta.url)))) {
+    process.stdout.write('  skip  the plugin is not built here (tsc -b && tsdown), so arming was not exercised\n')
+  } else {
+    const { apply: applyBuilt } = await import(pathToFileURL(builtEntry).href)
+    const armedLines = []
+    const restore = process.stderr.write
+    process.stderr.write = (chunk) => { armedLines.push(String(chunk)); return true }
+    const builtHost = makeHost({ web: true })
+    applyBuilt(builtHost.ctx, { ...SILENT, watchdog: true, watchdogWaitMs: 1_000, exitDelayMs: 40 })
+    const builtTool = builtHost.tools.find(candidate => candidate.name === 'dsh_restart')
+    await builtTool.execute({ reason: 'unit test arming the watchdog' })
+    builtHost.emit('agent/status', { agent: AGENT, status: 'idle' })
+    await sleep(700)
+    process.stderr.write = restore
+    const log = armedLines.join('')
+    ok('the built plugin exits on schedule', builtHost.exits.length === 1, JSON.stringify(builtHost.exits))
+    ok('and arms the watchdog before it goes',
+      log.includes('armed the watchdog'), log.split('\n').filter(line => line.includes('watchdog')).join(' | '))
+  }
+}
+
 agentServer.close()
+fakeAgentProcess.kill()
 
 process.stdout.write(`\n${checks - failures.length}/${checks} checks passed\n`)
 if (failures.length > 0) {

@@ -183,6 +183,28 @@ Agent 在**每次拉起进程之前**先把报告写到 `reports/<id>.json`（�
 "问不出来"不等于"没在跑"，宁可漏一次也不能把正在跑的重启判死。改写而不是删除：
 那个文件是这件事唯一的证据。
 
+## 看门狗：优雅重启没被接上时，它自己来
+
+工具触发的重启里，插件是那个**必须先死掉**的进程：它请求 Agent 重启，然后退出，让 Agent 拉起
+替代者。Agent 要是死在这个空档里，就没人去拉新进程了 —— dsh 一直停着，这正是这个插件存在的
+那类事故。
+
+所以退出前，插件会派一个看门狗（`lib/watchdog.js`，**两段式启动**成孤儿子进程，`taskkill /T /F`
+抓不到它）看着这次重启。它的原则只有一条：**只有确定没人在做这件事时才自己上手** ——
+
+| 它看到 | 它做什么 |
+|---|---|
+| `launch.json` 里是另一个活着的进程 | 收工（Agent、CLI、你自己拉的都算） |
+| 退出中的进程还活着 | 等 |
+| Agent 答"正在重启" | 等它做完 |
+| Agent 答"我闲着"，而 harness 已经没了 | 用原样命令行把 dsh 拉起来 |
+| Agent 静默超过 10 秒 | 当它死了，拉起来 |
+
+拉起时它顺手把那份没下文的报告补成终态（`ok`，说明是看门狗救回来的），并把过程写进
+`<state>/logs/watchdog.log`，被拉起进程自己的输出在 `logs/watchdog-relaunch-*.log`。
+它**只覆盖优雅重启**：CLI/HTTP 触发的强杀路径上插件已经死了，什么都没派出去；dsh 自己崩溃时
+也没人请求过重启。配置项：`watchdog`（默认开）、`watchdogWaitMs`（默认 120000）。
+
 ## 回滚基线（last-known-good）的语义
 
 - 快照**只在一个进程真的提交了启动之后**才写（`ctx.appReady` 回调），所以基线里的配置一定是
@@ -270,7 +292,8 @@ node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit   # 类型检查
 node node_modules/typescript/bin/tsc -b tsconfig.json            # 编译到 lib/types
 node node_modules/tsdown/dist/run.mjs                            # 打包 lib/index.js + lib/agent.js
 node tests/agent.e2e.mjs                                         # 43 项：Agent 侧（假 harness + CORS 行为）
-node --experimental-strip-types tests/plugin.test.mjs            # 29 项：插件侧（假 Agent HTTP 服务、启动对账）
+node --experimental-strip-types tests/plugin.test.mjs            # 33 项：插件侧（假 Agent HTTP 服务、启动对账、看门狗派发）
+node tests/watchdog.test.mjs                                     # 28 项：看门狗二进制（真的跑它，覆盖六种判定）
 node tests/client.test.mjs                                       # 58 项：客户端指示灯（stub window + slots）
 node tests/lamp.browser.mjs                                      # 25 项：真浏览器里的四种灯态（无 GUI 时跳过）
 ```

@@ -17,6 +17,15 @@ export const ENV_AGENT_URL = 'DSH_RESTART_AGENT'
 export const ENV_AGENT_TOKEN = 'DSH_RESTART_TOKEN'
 /** Environment variable carrying the attempt identity the agent is waiting on. */
 export const ENV_ATTEMPT = 'DSH_RESTART_ATTEMPT'
+/**
+ * Environment variable the resurrection watchdog stamps on the process it starts.
+ *
+ * It answers the same question {@link ENV_ATTEMPT} answers for the agent — "did
+ * somebody start this harness, or did it come up on its own?" — for the case
+ * where the agent died mid-restart and the watchdog had to finish the job. Boot
+ * reconciliation must not call a process abandoned when this is set.
+ */
+export const ENV_WATCHDOG = 'DSH_RESTART_WATCHDOG'
 /** Environment variable overriding the state directory (defaults under `$DSH_HOME`). */
 export const ENV_STATE_DIR = 'DSH_RESTART_STATE_DIR'
 

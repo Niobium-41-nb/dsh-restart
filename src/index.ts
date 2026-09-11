@@ -12,6 +12,8 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { spawn } from 'node:child_process'
+import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
@@ -20,12 +22,14 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type {
   AgentInfo, AgentStatus, AttemptOutcome, LaunchSpec, RestartReport, TrackedFiles,
 } from './protocol.ts'
-import { ENV_AGENT_TOKEN, ENV_AGENT_URL, ENV_ATTEMPT, STATE_VERSION } from './protocol.ts'
-import { ensureDir, listDir, makeId, nowIso, readJson, writeJsonAtomic } from './fsx.ts'
+import { ENV_AGENT_TOKEN, ENV_AGENT_URL, ENV_ATTEMPT, ENV_WATCHDOG, STATE_VERSION } from './protocol.ts'
+import { ensureDir, isFile, listDir, makeId, nowIso, readJson, sleep, writeJsonAtomic } from './fsx.ts'
 import { expandHomePath, resolveDshHome, resolveStateDir, instanceKey, instancePaths, statePaths, type InstancePaths, type StatePaths } from './paths.ts'
 import {
-  callRestart, ensureAgent, ensureToken, fetchStatus, postReady, readAgentInfo,
+  callRestart, ensureAgent, ensureToken, fetchStatus, postReady, readAgentInfo, SPAWN_COMMAND,
 } from './agent-client.ts'
+import { readLatestReport, rewriteReport } from './reports.ts'
+import { isAlive } from './agent/process-control.ts'
 import { expandTrackedPaths, readBaselineManifest, takeBaseline } from './snapshot.ts'
 
 /** Stable Cordis plugin name. */
@@ -47,16 +51,15 @@ const REPORT_SECTION_ORDER = 10_050
 const MAX_DELIVERED_REPORTS = 3
 
 /**
- * Budget for asking a *known* agent for its status during boot reconciliation.
+ * How long one probe of a *known* control agent may take.
  *
- * Larger than the 1.5s liveness probe used elsewhere on purpose: that probe is
- * issued at the busiest moment of the process (every module is still being
- * compiled), see {@link closeAbandonedReport}.
+ * Larger than a liveness check needs to be on an idle machine, because the
+ * first one is issued while the tree is still being compiled.
  */
-const RECONCILE_STATUS_TIMEOUT_MS = 5_000
+const AGENT_PROBE_TIMEOUT_MS = 5_000
 
-/** How many times boot reconciliation retries the question before giving up. */
-const RECONCILE_ATTEMPTS = 3
+/** How many times that probe is repeated before the agent counts as absent. */
+const AGENT_PROBE_ATTEMPTS = 3
 
 /**
  * Structural view of the system-prompt service.
@@ -157,6 +160,15 @@ export interface Config {
   idleExitMs: number
   /** Extra command-line arguments for the agent process. */
   agentArgs: string[]
+  /**
+   * Arm the resurrection watchdog before a graceful restart exits.
+   *
+   * It is the only thing standing between "the agent died mid-restart" and a
+   * harness that stays down until somebody notices. See `watchdog.ts`.
+   */
+  watchdog: boolean
+  /** How long the watchdog waits for a replacement before starting one itself. */
+  watchdogWaitMs: number
 }
 
 export const Config: z<Config> = z.object({
@@ -177,6 +189,8 @@ export const Config: z<Config> = z.object({
   exposeWebRoute: z.boolean().default(true),
   idleExitMs: z.natural().default(1_800_000),
   agentArgs: z.array(String).default([]),
+  watchdog: z.boolean().default(true),
+  watchdogWaitMs: z.natural().default(120_000),
 })
 
 /** The defaults, so a direct instantiation cannot read `undefined` for a knob. */
@@ -198,6 +212,8 @@ export const DEFAULTS: Config = {
   exposeWebRoute: true,
   idleExitMs: 1_800_000,
   agentArgs: [],
+  watchdog: true,
+  watchdogWaitMs: 120_000,
 }
 
 /**
@@ -238,9 +254,39 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 
+/**
+ * Probe the recorded control agent, retrying the one probe that races boot.
+ *
+ * `apply` runs while the module tree is still being compiled, and a request
+ * issued into that window can lose its budget and report "no agent" for an
+ * agent that is alive and answering a few milliseconds later. Believing it has
+ * two real costs: with `autoStartAgent` on, a second agent is started on the
+ * next free port while the first one is still serving; with it off, a restart
+ * is refused ("the control agent is not running") while a live supervisor sits
+ * right there. Measured in the isolated restart-lab profile, where this exact
+ * boot probe failed on some runs and succeeded on others with nothing else
+ * changed.
+ *
+ * @param info - the recorded agent identity.
+ * @param token - bearer token for the state directory.
+ * @returns true when the agent answered.
+ */
+async function probeRecordedAgent(info: AgentInfo, token: string): Promise<boolean> {
+  for (let attempt = 1; attempt <= AGENT_PROBE_ATTEMPTS; attempt += 1) {
+    if (await fetchStatus({ info, token, timeoutMs: AGENT_PROBE_TIMEOUT_MS }) !== undefined) return true
+    if (attempt < AGENT_PROBE_ATTEMPTS) await sleep(500)
+  }
+  return false
+}
+
 /** Absolute path of the bundled agent entry, next to this module. */
 function agentEntry(): string {
   return fileURLToPath(new URL('./agent.js', import.meta.url))
+}
+
+/** Absolute path of the bundled resurrection watchdog, next to this module. */
+function watchdogEntry(): string {
+  return fileURLToPath(new URL('./watchdog.js', import.meta.url))
 }
 
 /** Read the mounted profile directory from the Loader's base URL. */
@@ -402,8 +448,9 @@ export function apply(ctx: Context, config: Config): void {
     agentAttempt = (async (): Promise<AgentInfo | undefined> => {
       agent = undefined
       const recorded = readAgentInfo(paths)
-      if (recorded !== undefined
-        && await fetchStatus({ info: recorded, token, timeoutMs: 1_500 }) !== undefined) {
+      // A pid that is gone is settled without a single request: the common case
+      // at boot is an agent that idle-exited long before this process started.
+      if (recorded !== undefined && isAlive(recorded.pid) && await probeRecordedAgent(recorded, token)) {
         agent = recorded
         return agent
       }
@@ -490,23 +537,10 @@ export function apply(ctx: Context, config: Config): void {
       paths,
       log,
       status: async () => {
-        // Retried on purpose. The first probe is issued while the tree is still
-        // being compiled, and a probe that loses that race reports "no agent"
-        // for an agent that is alive and idle — measured in an isolated profile:
-        // with nothing applied before this plugin the boot probe failed on
-        // every run, and with one plugin ahead of it, never. The question is
-        // only asked when a restart is already suspected of being abandoned, so
-        // a few seconds here cost nothing and turn a silent miss into the
-        // detection this exists for.
-        for (let attempt = 1; attempt <= RECONCILE_ATTEMPTS; attempt += 1) {
-          const info = await ensureAgentHandle()
-          if (info !== undefined) {
-            const status = await fetchStatus({ info, token, timeoutMs: RECONCILE_STATUS_TIMEOUT_MS })
-            if (status !== undefined) return status
-          }
-          if (attempt < RECONCILE_ATTEMPTS) await new Promise(resolve => setTimeout(resolve, 500))
-        }
-        return undefined
+        // `ensureAgentHandle` already retried the probe that races boot (see
+        // probeRecordedAgent), so one request is enough here.
+        const info = await ensureAgentHandle()
+        return info === undefined ? undefined : await fetchStatus({ info, token, timeoutMs: AGENT_PROBE_TIMEOUT_MS })
       },
     }).then(() => {
       pending.push(...readPendingReports(paths))
@@ -544,6 +578,47 @@ export function apply(ctx: Context, config: Config): void {
   })
 
   /**
+   * Arm the resurrection watchdog for the restart this process is about to leave behind.
+   *
+   * Spawned through the watchdog's own two-stage launcher, so the process that
+   * actually watches the restart is reparented out of this dying tree and cannot
+   * be collected by a `taskkill /T` aimed at it. A missing bundle is reported and
+   * then ignored: the restart must still happen, it just has no safety net.
+   */
+  const armWatchdog = (): void => {
+    if (!resolved.watchdog) return
+    const entry = watchdogEntry()
+    if (!isFile(entry)) {
+      log(`no watchdog bundle at ${entry}; this restart has no safety net`)
+      return
+    }
+    try {
+      const child = spawn(process.execPath, [
+        entry,
+        SPAWN_COMMAND,
+        '--state-dir', paths.root,
+        '--instance', instance.key,
+        '--pid', String(process.pid),
+        '--wait-ms', String(resolved.watchdogWaitMs),
+        '--reason', 'graceful restart requested through the supervisor',
+      ], {
+        // The home directory, like every other long-lived helper this plugin
+        // starts: never a package directory, which Windows would lock.
+        cwd: homedir(),
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+        env: process.env,
+      })
+      child.unref()
+      log(`armed the watchdog for pid ${String(process.pid)} (waiting up to `
+        + `${String(resolved.watchdogWaitMs)} ms for a replacement)`)
+    } catch (error) {
+      log(`could not arm the watchdog: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  /**
    * Ask the launcher to exit once this turn has finished.
    *
    * The restart is requested from inside a turn, so leaving on a timer would
@@ -554,6 +629,11 @@ export function apply(ctx: Context, config: Config): void {
   const scheduleExit = (): void => {
     const exit = ctx.get('appExit') as AppExitLike | undefined
     const leave = (): void => {
+      // Armed here, at the last moment, rather than when the restart was
+      // accepted: until this point the process is still alive and the agent is
+      // still working, so a watchdog would only be an idle process holding a
+      // 120s timer through a turn that may take three minutes.
+      armWatchdog()
       log('exiting so the control agent can relaunch this process')
       if (exit !== undefined) exit(0)
       else process.exit(0)
@@ -887,8 +967,11 @@ function abandonedReport(report: RestartReport | undefined): RestartReport | und
   if (report.attempts.length > 0) return undefined
   // A process the agent spawned carries the attempt identity in its
   // environment, so having one means the restart was not interrupted before the
-  // spawn — it produced this very process.
+  // spawn — it produced this very process. The watchdog stamps its own mark on
+  // the process it starts for the same reason: it covers the case where the
+  // agent died and something else finished the restart.
   if (process.env[ENV_ATTEMPT] !== undefined) return undefined
+  if (process.env[ENV_WATCHDOG] !== undefined) return undefined
   return report
 }
 
@@ -932,30 +1015,22 @@ async function closeAbandonedReport(options: CloseAbandonedOptions): Promise<Res
     log(`restart ${report.id} is not the agent's newest report (${status.lastReport.id}); leaving it alone`)
     return undefined
   }
-  const closed: RestartReport = {
-    ...report,
-    status: 'failed',
-    headline: 'The previous restart was interrupted before it started any process: the control agent stopped '
-      + 'between recording the request and launching DeepSeek Harness, which stayed stopped until it was '
-      + 'started again.',
-    error: `reconciled at boot: report ${report.id} was still 'in-progress' with no attempts while no restart `
-      + 'was running, so no process was ever spawned for it',
-  }
+  let closed: RestartReport
   try {
-    writeJsonAtomic(join(paths.reports, `${report.id}.json`), closed)
+    closed = rewriteReport(paths, report, {
+      status: 'failed',
+      headline: 'The previous restart was interrupted before it started any process: the control agent stopped '
+        + 'between recording the request and launching DeepSeek Harness, which stayed stopped until it was '
+        + 'started again.',
+      error: `reconciled at boot: report ${report.id} was still 'in-progress' with no attempts while no restart `
+        + 'was running, so no process was ever spawned for it',
+    })
   } catch (error) {
     log(`could not close interrupted restart ${report.id}: ${error instanceof Error ? error.message : String(error)}`)
     return undefined
   }
   log(`closed interrupted restart ${report.id}: it was left 'in-progress' with no attempts and no restart is running`)
   return closed
-}
-
-/** Read the most recent report regardless of delivery state. */
-function readLatestReport(paths: StatePaths): RestartReport | undefined {
-  const names = listDir(paths.reports).filter(fileName => fileName.endsWith('.json')).sort().reverse()
-  const newest = names[0]
-  return newest === undefined ? undefined : readJson<RestartReport>(join(paths.reports, newest))
 }
 
 /** Mark reports as delivered so the next boot stays quiet about them. */

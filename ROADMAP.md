@@ -89,16 +89,55 @@ lab 里同一个配置连跑 4 次全失败（日志里是"no control agent answ
 间隔 500ms），并把"问不到"与"没在跑"分开。修完在同一个曾经必败的配置下连跑即通过。
 代价：只有在**已经是候选记录**时才付这几秒，正常启动路径完全不受影响。
 
-### 1.2 优雅路径的复活看门狗
+### 1.2 优雅路径的复活看门狗 —— ✅ 已完成（2026-09-11）
 
-**做法**：在 `scheduleExit()` 里、请求退出**之前**，孵化一个 detached 看门狗：
-等旧进程消失后，若 `launch.json` 里的 pid 在 N 秒内没有变成"活着的新进程"，就用记录的命令行拉起 dsh。
-插件此时还在进程内（不在任何 shell 的 Job 里），所以看门狗不会被 Job 连带杀死。
+**问题**：工具/服务触发的优雅重启有两半 —— 插件请求 Agent 重启，然后插件自己退出、由 Agent 拉起
+新进程。Agent 若死在这两半之间（就是本插件存在的那类事故），**没有任何人**会拉起新进程，
+dsh 就一直停着，而且这次连报告都不会有下文。
 
-**覆盖范围**：只覆盖「工具/服务触发的优雅重启」；**覆盖不到强杀路径**（那时插件已死）。
-写清楚这一点，别让人误以为它解决了 1.1 的全部场景。
+**做法（已实现）**：`src/watchdog.ts`，第 3 个独立产物 `lib/watchdog.js`（与 Agent 同样零
+harness 依赖）。插件在 `leave()` 里、真正退出**之前**用**两段式启动**把它派出去（`__spawn-detached`
+→ 短命 launcher → 孤儿子进程），所以针对垂死进程树的 `taskkill /T /F` 抓不到它。
+它每 `pollMs` 观察一次世界，判定规则是：
 
-**验收**：杀掉 Agent（模拟"Agent 在 spawn 前死亡"）后触发一次工具重启，dsh 能在 N 秒内自行恢复。
+| 观察 | 判定 |
+|---|---|
+| `launch.json` 的 pid 是**另一个活着的**进程 | 已经有人拉起来了 → 收工（谁拉的不重要） |
+| 退出的 pid 还活着 | 还没轮到它 → 继续等 |
+| 问得到 Agent 且 `busy: true` | 正在跑这次重启 → 让 Agent 做完 |
+| 问得到 Agent 且 `busy: false` | Agent 闲着而 harness 已经没了 → 接手 |
+| 问不到 Agent，已静默 ≥ `silenceMs`（默认 10s） | 判定已死 → 接手 |
+
+接手 = 用 `launch.json` 里记录的原样命令行（`execPath + execArgv + argv`，Web 面补 `--no-open`）
+detached 拉起，输出重定向到 `logs/watchdog-relaunch-*.log`，并给子进程打上
+`DSH_RESTART_WATCHDOG` 环境戳；同时把那份还停在 `in-progress` 的报告**补成终态**（`ok`，
+headline 说明是看门狗救回来的，`deliveredAt` 继承，永不重复投递）。写盘证据在 `logs/watchdog.log`。
+
+**覆盖范围（写清楚，别误以为它解决了 1.1 的全部场景）**：只覆盖**优雅路径**。
+强杀路径（CLI/HTTP 触发）插件已经死了，什么都没派出去；dsh 自己崩溃时也没人请求过重启。
+这两种情况剩下的信号只有灯和报告。
+
+**验收证据**（隔离 lab：base + 保活 + 驱动 + 探测，假 Agent **接受 `/restart` 后立刻自杀**）：
+
+```
+[dsh-restart] armed the watchdog for pid 3772 (waiting up to 90000 ms for a replacement)
+[dsh-restart] exiting so the control agent can relaunch this process
+[watchdog.log] taking over: outgoing pid 3772 is gone, no replacement is alive,
+               and the control agent has been unreachable for 10145 ms
+[watchdog.log] relaunched … bin.ts --profile restart-lab (cwd <HARNESS>) as pid 31848
+→ launch.json 变成 pid=31848 且 alive=True；被拉起进程自己的启动日志完整落盘
+```
+
+即"Agent 在 spawn 前死亡"后 **11 秒** dsh 自己回来了。另有 `tests/watchdog.test.mjs` **28 项**：
+真跑这个二进制，覆盖接手 / 已有替代进程时收手 / 退出进程还活着时等待 / Agent 忙碌时不插手 /
+Agent 闲着但没在重启时接手 / 短暂静默不算死亡 / 报告终态化并保留投递标记 / 两段式启动真的脱离，
+以及命令行不合法时拒绝猜测。
+
+**顺带修掉一个真问题**：boot 阶段那次存活探测**不只是超时**——1.5 秒预算 + 单次尝试，输了就
+把活着的 Agent 判成"没在跑"。在 `autoStartAgent: false` 下这会**直接拒绝一次重启**
+（lab 里复现两次），在默认配置下会**另起一个 Agent 到下一个端口**（真实日志里
+`control agent ready at http://127.0.0.1:3100` 就是它）。现在：先看 pid 是否还活着（快路径，
+省掉三次无用请求），再**最多问 3 次、每次 5 秒预算**。1.1 里那段专门为重试写的对账循环随之简化。
 
 ### 1.3 Job 继承的自动检测（可选，成本高）
 
