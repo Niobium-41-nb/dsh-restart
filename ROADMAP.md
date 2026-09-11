@@ -7,25 +7,39 @@
 
 ---
 
-## P0 — 收尾：两件已实现但未亲眼验证的事
+## P0 — 收尾：两件已实现但未亲眼验证的事（0.1 已完成）
 
-### 0.1 侧边栏指示灯的视觉确认
+### 0.1 侧边栏指示灯的视觉确认 —— ✅ 已完成（2026-09-11），而且**查出一个真 bug**
 
-**现状**：客户端半边已经发布、服务端吐出的 bundle 与源码逐字节一致、插槽是侧边栏真实渲染的位置
-（`SidebarRoot.tsx:270` 的 `renderSlot('sidebar.footer.action', …)`），单测覆盖了注册、
-四种状态映射与渲染兜底。**但没有用肉眼看它渲染出来。**
+**结果**：灯**从来没有画出来过**。单测、类型检查、启动图、服务端字节比对全部通过，
+浏览器控制台里却只有一行 warning：
 
-**为什么值得做**：指示灯的全部价值就是"一眼可见"；一个注册成功但视觉上不可见的组件等于没有。
+```
+[dsh-restart] could not register the supervisor indicator: Error: slot "sidebar.footer.action"
+is not declared (a parent entry's children table must declare it)
+```
 
-**验收**：
-- 打开 Web GUI，侧边栏底部（Settings 旁边）能看到绿灯（无文字）；
-- `node <PLUGINS>/dsh-restart/lib/agent.js stop` 后数秒内变红并显示「守护未运行」；
-- 再重启一次 dsh（或让插件重新拉起 Agent）后恢复绿灯。
+`slots.register` 要求槽位**已被声明**，而这个座位是侧边栏注册自己的 entry 时才声明的；
+插件之间 apply 顺序不是契约，抢跑就抛异常 —— 而 `apply` 里的 `try/catch` 把它降级成一行
+warning，于是"没有灯"看起来和"灯坏了"一样安静。
 
-**手段**：`agent-browser`（已全局安装，Chrome 也在）：
-`agent-browser open "http://127.0.0.1:3080/?token=<token>"` → `snapshot`/`screenshot`。
-token 在最近一次 attempt 日志里（`dsh web: http://127.0.0.1:3080/?token=…`）。
-**注意**：侧边栏折叠时这个插槽可能不渲染（`renderSlot(..., { wide })`），截图前确认侧边栏是展开的。
+**修法**（三处，都已入库）：
+1. `slots.inject('sidebar.footer.action', …)` 等声明，而不是直接注册（同 `dsh-cost-meter`、
+   `dsh-model-scheduler` 的写法）；
+2. 灯的点要额外声明 `corner-shape: round`：宿主主题把**所有**圆角平滑成 superellipse，
+   `border-radius: 50%` 渲染出来是圆角方块（8px 与 40px 对照元素都是，不是尺寸问题）；
+3. 文案压到 2–3 个字并去掉横向内边距：那一行前面的条目已经占掉 215px，灯只有 ~53px，
+   `守护在线 · DSH 重启中` 会被侧边栏切掉半个字（完整句子留在 tooltip）。
+
+**验收证据**：新增 `tests/lamp.browser.mjs`（25 项）—— 真 Chrome + CDP 打开真 GUI，四种状态
+逐个截图并断言颜色 / 文案 / 圆形 / 不被裁切；状态由**浏览器内拦请求**造出（拦 3099 或
+`/dsh-restart/status`），**不会停真实 Agent**。另外手动做过一次"真停 Agent → 变红 → 用
+`dsh_restart_status` 让插件把它拉回来 → 变绿"的闭环（同一张打开的页面，没有刷新）。
+客户端单测从 31 项涨到 58 项（新增声明时序、圆形、省略号三条契约的回归）。
+
+**顺带确认**：手写 `client/index.js` 的改动**不需要重启 DSH** —— 宿主的 client-HMR 每 500ms
+轮询 bundle 的 stat，重新哈希后经 SSE 通知浏览器重取（实测 rev 从 `28e1db08b1d0` 一路变到
+`cd4a7048d5f2`，页面照常）。这给未来改客户端半边省下一整轮重启。
 
 ### 0.2 「退出前等回合结束」的真实链路验证
 
@@ -120,6 +134,12 @@ dsh 曾被留在停止状态"），并在启动日志里明说。
 
 ## 验收纪律
 
-改任何东西之后：`tsc --noEmit` → 三个测试文件全绿（43 + 15 + 31）→ 需要时上隔离 lab profile →
-最后才动真实环境。**不要为了验证而杀死自己的会话**：要么把说明写在触发之前，
+改任何东西之后：`tsc --noEmit` → 四个测试文件全绿（43 + 15 + 58 + 25 浏览器）→ 需要时上隔离
+lab profile → 最后才动真实环境。
+
+**客户端的改动必须跑 `tests/lamp.browser.mjs`**：0.1 那次事故证明，类型检查、单测、启动图、
+字节比对可以同时全绿而灯根本不存在。它需要一个在跑的 Web GUI（`DSH_GUI_URL`，默认 3080），
+没有就自动跳过 —— **跳过不算通过**。
+
+**不要为了验证而杀死自己的会话**：要么把说明写在触发之前，
 要么用异步 202 + 足够的 `stopGraceMs` 留出窗口。

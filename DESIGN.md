@@ -144,6 +144,51 @@ Origin 放行**，并且 `/health` 本来就不含任何敏感信息（pid/端�
 宿主侧另开了一条 `/dsh-restart/status`（插件命名空间，不走 `/api`，避免撞上连接插件的请求围栏），
 只返回 Agent 地址 + 最近一次重启的状态摘要，供指示灯在 Harness 在线时校准 URL 与文案。
 
+### 6.1 座位是**声明**出来的，所以必须 `slots.inject`
+
+第一版客户端半边在 `apply` 里直接 `scope.slots.register({ name: 'sidebar.footer.action', … })`。
+它**什么都没画出来**，而且不报错给人看 —— 只有浏览器控制台里一行 warning：
+
+```
+[dsh-restart] could not register the supervisor indicator: Error: slot "sidebar.footer.action"
+is not declared (a parent entry's children table must declare it)
+```
+
+原因是这个座位属于**另一个 entry**：侧边栏在它自己的 `apply` 里注册 `sidebar` 这个 entry 时，
+才用 `children: { 'sidebar.footer.action': { kind: 'list', scope: 'root' } }` 把它声明出来。
+插件之间的 apply 顺序不是契约，抢跑就输。
+
+正确写法是 `slots.inject(key, callback)`：**声明已经存在就同步调用，否则在声明提交时调用**
+（声明塌掉再重建还会再调一次），回调返回的就是注销函数。作者本机另一个插件
+（`dsh-model-scheduler`）用的就是这个形式，`dsh-cost-meter` 也是 —— 只有这个插件写错了。
+
+这件事的教训不是"漏了 try/catch"，而是**验证层级**：类型检查、单测、启动图、服务端字节比对
+全部通过，灯依然不存在。只有真浏览器能把"注册了"和"画出来了"分开 —— 于是有了
+`tests/lamp.browser.mjs`（见第 11 节）。
+
+### 6.2 主题会把圆角磨成 superellipse，正圆要自己声明回来
+
+`ui-theme` 的 `corner-shape.css` 在 `@supports (corner-shape: superellipse(1.5))` 里对
+`*` 施加 `corner-shape`：**所有圆角都被平滑成超椭圆**。于是 `border-radius: 50%` 渲染出来是
+一个圆角方块 —— 实测在 8px 的灯上是这样，40px 的对照元素也是这样，所以不是尺寸问题。
+
+要正圆就得配对声明 `corner-shape: round`（宿主自己的 `StateDot` 就是这么做的）。灯的价值
+有一半在"形状一眼可辨"，所以这条必须照做。
+
+### 6.3 侧边栏底部只给得起 ~53px
+
+那一行（`footerActions`）是横向排布，前面的条目（成本看板的余额/今日两行、另一个插件的
+entry row）会先占掉 215px；在默认 280px 侧边栏里，灯从落点到侧边栏裁切边只剩 **53px**，
+而圆点 + 间距要花掉 14px。所以：
+
+- 文案压到 2–3 个字（`重启中` / `未运行` / `无响应`），完整句子放 tooltip；
+- 组件不留横向内边距（`padding: '2px 0'`）——实测那 16px 正好是从文案里扣的，会让最后一个
+  字被侧边栏切掉；
+- 文案 span 带 `overflow: hidden` + `textOverflow: ellipsis`，侧边栏更窄时**优雅省略**而不是
+  硬切半个字。
+
+绿态刻意不带文字：一切正常时它应该是一个点，而不是一句话。
+
 ## 7. 三个被真实事故逼出来的修正
 
 ### 7.1 报告必须在 spawn 之前写（否则迟到一整轮）
@@ -256,6 +301,15 @@ Agent 被自己那条命令杀掉：
 
 - `appendArgs`：有 Web 面时是 `['--no-open']`，没有时一个都不加；
 - 退出时机：回合还在跑就不退；回合结束才退；只跑着子代理时不等待；超时封顶后照样退。
+
+`tests/client.test.mjs` 用假的 `window` / `require` / `slots` 盯住客户端半边的契约：
+**声明之前不许注册**（第 6.1 节那个 bug 的回归）、声明到达后只注册一次、四种状态的映射、
+圆形与省略号这两条样式契约，以及"渲染抛异常只返回 null、绝不带崩界面"。
+
+`tests/lamp.browser.mjs` 是**真实读回**那一层：无头 Chrome + CDP 打开真 GUI，四种灯态逐个
+截图并断言颜色 / 文案 / 形状 / 不被侧边栏裁切。四种状态由**浏览器内拦截请求**造出来
+（拦 3099 或 `/dsh-restart/status`），因此**不需要停掉真实 Agent**，随时可跑；没有 GUI 或
+没有 Chrome 时它自己跳过。单测和字节比对曾经全绿而灯根本没出现 —— 这一层就是为那件事写的。
 
 真实 launcher 的验证在隔离的 `restart-lab` profile 上做（`@deepseek-ai/dsh-base` + 一个保活
 插件 + dsh-restart），完整跑通了：

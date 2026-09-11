@@ -36,6 +36,10 @@ window.__ModuleLoader__.load({
     var PROBE_MS = 3000
     /** Host route carrying the agent URL and the last restart report. */
     var HOST_ROUTE = '/dsh-restart/status'
+    /** The sidebar seat this lamp occupies. */
+    var SLOT = 'sidebar.footer.action'
+    /** Stable occupancy id, so a re-apply replaces rather than duplicates. */
+    var ENTRY_ID = 'dsh-restart-indicator'
 
     function readUrl() {
       try {
@@ -74,11 +78,17 @@ window.__ModuleLoader__.load({
       return 'unreachable'
     }
 
+    // Labels are kept SHORT on purpose. The lamp sits in the sidebar foot next
+    // to the right edge, and the host aligns it there: measured in a browser at
+    // the default 280px sidebar, only ~48px of label width is on screen before
+    // the sidebar clips it. A long label is therefore not "informative", it is
+    // sliced mid-glyph — the full sentence belongs in the tooltip, which is
+    // where a user who wants the why will look anyway.
     var LOOK = {
       ready: { color: '#22c55e', label: '', title: '重启守护在线' },
-      restarting: { color: '#f59e0b', label: '守护在线 · DSH 重启中', title: '控制 Agent 在线，DeepSeek Harness 正在重启，页面会自动恢复' },
-      'agent-down': { color: '#ef4444', label: '守护未运行', title: '控制 Agent 没有响应：现在重启不会自动拉起 DSH（下次请求重启时插件会尝试重新拉起它）' },
-      unreachable: { color: '#ef4444', label: '守护无响应 · 需手动启动', title: 'DeepSeek Harness 已停止，且控制 Agent 也没有响应：不会自动恢复，请手动启动 DSH' },
+      restarting: { color: '#f59e0b', label: '重启中', title: '控制 Agent 在线，DeepSeek Harness 正在重启，页面会自动恢复' },
+      'agent-down': { color: '#ef4444', label: '未运行', title: '控制 Agent 没有响应：现在重启不会自动拉起 DSH（下次请求重启时插件会尝试重新拉起它）' },
+      unreachable: { color: '#ef4444', label: '无响应', title: 'DeepSeek Harness 已停止，且控制 Agent 也没有响应：不会自动恢复，请手动启动 DSH' },
     }
 
     /**
@@ -151,7 +161,13 @@ window.__ModuleLoader__.load({
             display: 'flex',
             alignItems: 'center',
             gap: '6px',
-            padding: '2px 8px',
+            // Measured in a real browser: the sidebar foot is a row that packs
+            // left to right, and the entries before this lamp already fill it.
+            // At the default 280px sidebar the lamp gets 53px from where it
+            // starts to the sidebar's clip edge, and the dot plus gap spend 14
+            // of it — so horizontal padding would come straight out of the
+            // label and push the text past the edge. Vertical padding only.
+            padding: '2px 0',
             fontSize: '11px',
             lineHeight: '18px',
             color: 'var(--dsh-text-secondary, #8b8b8b)',
@@ -165,6 +181,12 @@ window.__ModuleLoader__.load({
             width: '8px',
             height: '8px',
             borderRadius: '50%',
+            // The host theme smooths EVERY rounded corner into a superellipse
+            // (`ui-theme`'s corner-shape.css sets `corner-shape` on `*`), which
+            // deforms a 50% radius into a rounded square — measured in a real
+            // browser: the lamp rendered as a squircle. Full-round shapes opt
+            // back out; the host's own StateDot does the same.
+            cornerShape: 'round',
             background: look.color,
             boxShadow: '0 0 0 2px ' + look.color + '33',
             flex: '0 0 auto',
@@ -172,8 +194,62 @@ window.__ModuleLoader__.load({
             transition: 'opacity .2s ease',
           },
         }),
-        look.label === '' ? null : R.createElement('span', null, look.label),
+        look.label === '' ? null : R.createElement('span', {
+          style: {
+            // Degrade by ellipsis, never by a hard slice: a narrower sidebar (or
+            // a longer translation) must still read as text, not as a clipped
+            // glyph. `minWidth: 0` lets a flex item shrink below its content.
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+            minWidth: 0,
+          },
+        }, look.label),
       )
+    }
+
+    /**
+     * Claim the sidebar seat, whenever the host declares it.
+     *
+     * `slots.register` throws for a slot that is not declared yet ("a parent
+     * entry's children table must declare it"), and `sidebar.footer.action` is
+     * declared as a child of the `sidebar` entry — which ui-sidebar registers
+     * from its own apply. Plugin apply order is not a contract, so registering
+     * eagerly loses that race and the lamp silently never appears (measured on
+     * 0.1.5: the bundle loaded, `register` threw, the console carried
+     * "could not register the supervisor indicator").
+     *
+     * `slots.inject` is the declaration-aware form: it runs the callback
+     * immediately when the seat already exists, and inside the declaring
+     * `register()` call otherwise — and again if the declaration collapses and
+     * returns. The returned disposer is the registration's own.
+     *
+     * @param slots - the host slot registry.
+     * @returns a disposer that removes the occupancy (or a no-op).
+     */
+    function claimSeat(slots) {
+      var options = { name: SLOT, id: ENTRY_ID, order: 40 }
+
+      function register() {
+        try {
+          return slots.register(options, Indicator)
+        } catch (error) {
+          console.warn('[dsh-restart] could not register the supervisor indicator:', error)
+          return function () {}
+        }
+      }
+
+      if (typeof slots.inject === 'function') {
+        try {
+          return slots.inject(SLOT, register)
+        } catch (error) {
+          console.warn('[dsh-restart] could not wait for the sidebar seat:', error)
+          return function () {}
+        }
+      }
+      // A host without declaration-aware injection: the direct route is all
+      // that shape allows, and it works only when the seat is declared already.
+      return register()
     }
 
     function apply(ctx) {
@@ -183,14 +259,13 @@ window.__ModuleLoader__.load({
       // host that has no sidebar (headless, sdk, acp).
       ctx.inject(['slots'], function (scope) {
         try {
+          var slots = scope === undefined || scope === null ? undefined : scope.slots
+          if (slots === undefined || typeof slots.register !== 'function') return
           // Resolve the one dependency now, not during a render: a component
           // that throws while the sidebar draws it is far worse than a
           // component that never gets registered.
           React()
-          scope.slots.register(
-            { name: 'sidebar.footer.action', id: 'dsh-restart-indicator', order: 40 },
-            Indicator,
-          )
+          claimSeat(slots)
         } catch (error) {
           console.warn('[dsh-restart] could not register the supervisor indicator:', error)
         }
@@ -207,6 +282,8 @@ window.__ModuleLoader__.load({
       LOOK: LOOK,
       DEFAULT_AGENT: DEFAULT_AGENT,
       HOST_ROUTE: HOST_ROUTE,
+      SLOT: SLOT,
+      ENTRY_ID: ENTRY_ID,
       readUrl: readUrl,
       writeUrl: writeUrl,
     }

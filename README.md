@@ -136,9 +136,12 @@ Web GUI 侧边栏底部（Settings 旁边）有一个小圆点，显示控制 Ag
 | 灯 | 含义 |
 |---|---|
 | 🟢 绿点（无文字） | 守护在线，随时可以重启 |
-| 🟠 琥珀 +「守护在线 · DSH 重启中」 | Harness 已停、守护在线 —— 正在拉起，页面会自动恢复 |
-| 🔴 红 +「守护未运行」 | Harness 在跑但 Agent 没响应；重启不会自动拉起（下次请求重启时插件会尝试重新拉起它） |
-| 🔴 红 +「守护无响应 · 需手动启动」 | **两边都没了** —— 不会自动恢复，请手动启动 DSH |
+| 🟠 琥珀 +「重启中」 | Harness 已停、守护在线 —— 正在拉起，页面会自动恢复 |
+| 🔴 红 +「未运行」 | Harness 在跑但 Agent 没响应；重启不会自动拉起（下次请求重启时插件会尝试重新拉起它） |
+| 🔴 红 +「无响应」 | **两边都没了** —— 不会自动恢复，请手动启动 DSH |
+
+标签刻意只有两三个字：灯待在侧边栏底部、**只分到约 53px**（前面的条目已经占满了那一行），
+再长就会被侧边栏裁掉半个字。完整的那句话在鼠标悬停的 tooltip 里（含最近一次重启的结果）。
 
 **它直连 Agent 的 3099 端口，不经过 Harness。** 这一点是关键：页面一旦加载进浏览器，
 即使 Harness 已经停了，JS 还在跑 —— 所以只有直连才能在"干等"的那一刻告诉你到底是
@@ -146,7 +149,10 @@ Web GUI 侧边栏底部（Settings 旁边）有一个小圆点，显示控制 Ag
 
 实现上的取舍：客户端半边是手写的 lazy-CJS bundle（`client/index.js`），**只 `require('react')`**，
 一个 `@deepseek-ai/dsh-client-*` 包都不依赖 —— 避免重蹈 `dsh-notification` 那个"客户端 bundle 引用
-已移除的包、整个 Web 界面卡在 Failed to load plugins"的覆辙。
+已移除的包、整个 Web 界面卡在 Failed to load plugins"的覆辙。进侧边栏的座位用
+`slots.inject('sidebar.footer.action', …)` 等宿主声明（**不能**在 `apply` 里直接 `register`，
+那个座位是侧边栏自己注册时才声明的），灯的圆形要额外声明 `corner-shape: round`
+（宿主主题会把所有圆角平滑成 superellipse）。三条都是实测踩出来的，细节见 `DESIGN.md` 第 6 节。
 
 Agent 的 `/health` 为此加了 CORS，且**只对回环来源**（`127.0.0.1` / `localhost` / `::1`）放行 ——
 公网页面没有理由探测本机的重启守护。
@@ -255,8 +261,16 @@ node node_modules/typescript/bin/tsc -b tsconfig.json            # 编译到 lib
 node node_modules/tsdown/dist/run.mjs                            # 打包 lib/index.js + lib/agent.js
 node tests/agent.e2e.mjs                                         # 43 项：Agent 侧（假 harness + CORS 行为）
 node --experimental-strip-types tests/plugin.test.mjs            # 15 项：插件侧（假 Agent HTTP 服务）
-node tests/client.test.mjs                                       # 25 项：客户端指示灯（stub window + slots）
+node tests/client.test.mjs                                       # 58 项：客户端指示灯（stub window + slots）
+node tests/lamp.browser.mjs                                      # 25 项：真浏览器里的四种灯态（无 GUI 时跳过）
 ```
+
+`tests/lamp.browser.mjs` 是唯一能证明"灯真的画出来了"的检查：**它开一个无头 Chrome，用 CDP
+把四种状态逐个截出来**，断言颜色、文案、圆形，以及文案没有被侧边栏裁掉。四种状态是靠
+**在浏览器里拦请求**造出来的（不给 3099 或 `/dsh-restart/status` 放行），所以它**不会动真实
+的 Agent**，随时可以跑。它需要 Web GUI 在跑（`DSH_GUI_URL`，默认 3080），需要 Chrome
+（`CHROME_PATH`），没有就跳过 —— 单测和字节比对曾经全绿而灯根本没出现，这个检查就是为
+那件事写的。
 
 `node_modules` 里的 `@deepseek-ai/*` 是指向 `<HARNESS>` 的 junction，仅用于编译期类型。
 
