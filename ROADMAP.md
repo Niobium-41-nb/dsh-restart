@@ -205,6 +205,10 @@ Agent 闲着但没在重启时接手 / 短暂静默不算死亡 / 报告终态�
 2. **CI**：`.github/workflows/check.yml`（同级仓库 `dsh-html-output` 有范本）跑 typecheck + 单测；
    `toast.e2e.mjs` 需要 Windows + 真实桌面，CI 里跳过。
 3. **CHANGELOG**。
+4. **发布到 npm**（2026-09-11 起挂账）：包里的一切都就绪（`files` 只带 `lib`/`bin`/`client`/文档），
+   但 npm 上的 `dsh-restart` 属于别人（anweat），只能以 `@vanadium-23/dsh-restart` 发布 ——
+   发布脚本 `../.scratch/publish-npm.mjs` 会在打包前临时改名、发完还原。
+   当前卡在 2FA（需要会 bypass 2FA 的 token），状态见 `../AGENTS.md` 第 4.3 节。
 
 ---
 
@@ -219,8 +223,8 @@ Agent 闲着但没在重启时接手 / 短暂静默不算死亡 / 报告终态�
 
 ## 验收纪律
 
-改任何东西之后：`tsc --noEmit` → 五个测试文件全绿（agent.e2e 43 + plugin 70 + watchdog 28 +
-client 87 + 浏览器 34）→ 需要时上隔离 lab profile → 最后才动真实环境。
+改任何东西之后：`tsc --noEmit` → 五个测试文件全绿（agent.e2e 43 + plugin 80 + watchdog 28 +
+client 95 + 浏览器 34 = 280 项）→ 需要时上隔离 lab profile → 最后才动真实环境。
 
 **客户端的改动必须跑 `tests/lamp.browser.mjs`**：0.1 那次事故证明，类型检查、单测、启动图、
 字节比对可以同时全绿而灯根本不存在。它需要一个在跑的 Web GUI（`DSH_GUI_URL`，默认 3080），
