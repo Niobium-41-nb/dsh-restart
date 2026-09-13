@@ -214,8 +214,10 @@ Agent 闲着但没在重启时接手 / 短暂静默不算死亡 / 报告终态�
    第 4.3 节与硬规则 22。
    产物已读回验证（`node ../.scratch/verify-published.mjs`：名字/版本/`repository`/
    `README`+`LICENSE` 齐全，无 `workspace:` 泄漏）。
-   **剩下的工程侧收尾**：把发布迁到 trusted publishing（OIDC）—— bypass token 的直发能力
-   2027-01 前后移除；包现在已存在，可以直接在 npm 设置页配 trusted publisher。
+   **免 token 发布的 workflow 已入库（2026-09-13）**：`.github/workflows/publish.yml` 用
+   trusted publishing（OIDC）发布；**只剩 npm 侧的 trusted publisher 配置**（每个包一次，
+   需人在浏览器里过 2FA）—— 照工作区根目录的 `TRUSTED-PUBLISHING.md` 做，里面也写了两个
+   会静默失败的坑与限制（私有仓库没有 provenance、OIDC 只覆盖 publish 命令、只支持云托管运行器）。
 
 ---
 
