@@ -205,10 +205,14 @@ Agent 闲着但没在重启时接手 / 短暂静默不算死亡 / 报告终态�
 2. **CI**：`.github/workflows/check.yml`（同级仓库 `dsh-html-output` 有范本）跑 typecheck + 单测；
    `toast.e2e.mjs` 需要 Windows + 真实桌面，CI 里跳过。
 3. **CHANGELOG**。
-4. **发布到 npm**（2026-09-11 起挂账）：包里的一切都就绪（`files` 只带 `lib`/`bin`/`client`/文档），
-   但 npm 上的 `dsh-restart` 属于别人（anweat），只能以 `@vanadium-23/dsh-restart` 发布 ——
-   发布脚本 `../.scratch/publish-npm.mjs` 会在打包前临时改名、发完还原。
-   当前卡在 2FA（需要会 bypass 2FA 的 token），状态见 `../AGENTS.md` 第 4.3 节。
+4. **发布到 npm**（2026-09-11 起挂账，2026-09-13 更新结论）：包里的一切都就绪（`files` 只带
+   `lib`/`bin`/`client`/文档，manifest 已补 `repository`），但 npm 上的 `dsh-restart` 属于别人
+   （anweat），只能以 `@vanadium-23/dsh-restart` 发布 —— 发布脚本 `../.scratch/publish-npm.mjs`
+   会在打包前临时改名、发完还原。
+   **卡的不是 token**：9-13 实测当前那枚带 `bypass_2fa` 的 token 能读不能发布（npm `EOTP` /
+   pnpm `ERR_PNPM_OTP_NON_INTERACTIVE`），缺的是**一次交互式 2FA**。做法：在真终端里跑
+   `node ../.scratch/publish-npm.mjs`（pnpm 会提示输入动态码），或先 `npm login --auth-type=web`。
+   状态与长期方案（trusted publishing，2027-01 前必须迁移）见 `../AGENTS.md` 第 4.3 节与硬规则 22。
 
 ---
 
