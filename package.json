@@ -2,6 +2,10 @@
   "name": "dsh-restart",
   "version": "0.1.0",
   "description": "Out-of-process restart supervisor for DeepSeek Harness: a small control agent on its own port restarts dsh, rolls the profile configuration back to the last known-good snapshot when the new boot fails, and hands the failure report to the restarted harness",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Niobium-41-nb/dsh-restart.git"
+  },
   "license": "MIT",
   "private": true,
   "type": "module",
