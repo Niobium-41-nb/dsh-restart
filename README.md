@@ -7,6 +7,10 @@
 **独立的、不在 DSH 进程树里的小型控制 Agent**：它替你停进程、按原样的命令行重新拉起、盯着新进程
 有没有真的起来；起不来就**回滚到上一次成功启动时的配置**再启一次，并把报错写下来交给重启后的 DSH。
 
+64 秒宣传片：[`dsh-restart-intro.mp4`](./dsh-restart-intro.mp4)（带中文旁白；标题是
+「我用 deepseek-harness 做了一个用来启动 deepseek-harness 的 deepseek-harness 插件」，
+制作工程在 `../dsh-restart-video/`）。
+
 ```
 ┌──────────────────────────── DSH 进程（会被重启的那个） ────────────────────────────┐
 │  dsh-restart 插件                                                                 │
