@@ -205,15 +205,17 @@ Agent 闲着但没在重启时接手 / 短暂静默不算死亡 / 报告终态�
 2. **CI**：`.github/workflows/check.yml`（同级仓库 `dsh-html-output` 有范本）跑 typecheck + 单测；
    `toast.e2e.mjs` 需要 Windows + 真实桌面，CI 里跳过。
 3. **CHANGELOG**。
-4. **发布到 npm**（2026-09-11 起挂账，2026-09-13 更新结论）：包里的一切都就绪（`files` 只带
-   `lib`/`bin`/`client`/文档，manifest 已补 `repository`），但 npm 上的 `dsh-restart` 属于别人
-   （anweat），只能以 `@vanadium-23/dsh-restart` 发布 —— 发布脚本 `../.scratch/publish-npm.mjs`
-   会在打包前临时改名、发完还原。
-   **卡的不是 token**：9-13 实测当前那枚带 `bypass_2fa` 的 token 能读不能发布（npm `EOTP` /
-   pnpm `ERR_PNPM_OTP_NON_INTERACTIVE`），**而且 `npm login --auth-type=web` 也不解锁**
-   （换过凭据后重发仍是 `EOTP`）。做法只有一个：**人在真终端里跑**
-   `node ../.scratch/publish-npm.mjs`，让 CLI 能提示输入动态码（agent 的非 TTY shell 永远过不去）。
-   状态与长期方案（trusted publishing，2027-01 前必须迁移）见 `../AGENTS.md` 第 4.3 节与硬规则 22。
+4. **发布到 npm** —— ✅ **已完成（2026-09-13）**：以 `@vanadium-23/dsh-restart@0.1.0` 上线
+   （`dsh-restart` 这个名字属于 anweat，只能用 scope 别名；脚本临时改名、发完还原）。
+   走通的做法：**人在真终端里跑** `node ../.scratch/publish-npm.mjs`，pnpm 对每个目标打印一条
+   `Authenticate your account at: https://www.npmjs.com/auth/cli/<uuid>` + 二维码，回车 →
+   浏览器过 2FA → 该包发布成功。**换凭据解决不了**（`bypass_2fa` token 与 `npm login
+   --auth-type=web` 都只解决"读"），**agent 的非 TTY shell 永远过不去** —— 见 `../AGENTS.md`
+   第 4.3 节与硬规则 22。
+   产物已读回验证（`node ../.scratch/verify-published.mjs`：名字/版本/`repository`/
+   `README`+`LICENSE` 齐全，无 `workspace:` 泄漏）。
+   **剩下的工程侧收尾**：把发布迁到 trusted publishing（OIDC）—— bypass token 的直发能力
+   2027-01 前后移除；包现在已存在，可以直接在 npm 设置页配 trusted publisher。
 
 ---
 
