@@ -1,5 +1,7 @@
 # dsh-restart
 
+[![check](https://github.com/Niobium-41-nb/dsh-restart/actions/workflows/check.yml/badge.svg)](https://github.com/Niobium-41-nb/dsh-restart/actions/workflows/check.yml) [![npm](https://img.shields.io/npm/v/%40vanadium-23%2Fdsh-restart)](https://www.npmjs.com/package/@vanadium-23/dsh-restart) [![license](https://img.shields.io/github/license/Niobium-41-nb/dsh-restart)](https://github.com/Niobium-41-nb/dsh-restart/blob/master/LICENSE)
+
 给 DeepSeek Harness 用的**进程外重启插件**。
 
 装插件、改 `cordis.patch.yml`、动 `package.json` 之后，DSH 需要重启才能生效；重启本身又最容易出事——
