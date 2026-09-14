@@ -1,0 +1,56 @@
+# Typecheck and the four host-side test suites, on every push.
+#
+# Runs on Windows on purpose: this plugin drives `taskkill`, PowerShell 5.1 and
+# Windows toast notifications, and its POSIX branches have never been exercised
+# on a real Linux or macOS machine. A green Linux run would prove less than it
+# looks like it proves.
+#
+# `tests/lamp.browser.mjs` is deliberately NOT here: it needs a running Web GUI
+# and a real Chrome, and it skips (not passes) without them. Run it locally.
+name: check
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      # No `cache:` on purpose: this repository has no pnpm-lock.yaml, and
+      # setup-node's pnpm cache fails outright when there is no lockfile.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Typecheck
+        run: node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit
+
+      # Two artifacts the tests need: `lib/agent.js` and `lib/watchdog.js` are
+      # spawned as real processes, and they are gitignored build output.
+      - name: Build
+        run: |
+          node node_modules/typescript/bin/tsc -b tsconfig.json
+          node node_modules/tsdown/dist/run.mjs
+
+      - name: Test — the control agent
+        run: node tests/agent.e2e.mjs
+
+      - name: Test — the host plugin
+        run: node --experimental-strip-types tests/plugin.test.mjs
+
+      - name: Test — the watchdog binary
+        run: node tests/watchdog.test.mjs
+
+      - name: Test — the browser half
+        run: node tests/client.test.mjs
