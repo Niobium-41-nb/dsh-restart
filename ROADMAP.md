@@ -202,8 +202,13 @@ Agent 闲着但没在重启时接手 / 短暂静默不算死亡 / 报告终态�
 1. **抽 `dsh-plugin-kit`**：状态目录解析、原子写、哈希/快照、PowerShell 调用与 base64 编码、
    客户端 bundle 脚手架 —— 现在两个插件各写了一遍（`fsx.ts` / `paths.ts` / `snapshot.ts` 几乎可原样共享）。
    注意：`dsh-ping` 刻意不依赖任何本地包，抽包时要保留"可以被单文件复制"的选项。
-2. **CI**：`.github/workflows/check.yml`（同级仓库 `dsh-html-output` 有范本）跑 typecheck + 单测；
-   `toast.e2e.mjs` 需要 Windows + 真实桌面，CI 里跳过。
+2. **CI** —— ✅ **已完成（2026-09-14）**：`.github/workflows/check.yml` 跑 typecheck + 四个宿主侧
+   测试（agent.e2e / plugin / watchdog / client）。两个刻意的选择：`runs-on: windows-latest`
+   （这个插件驱动 `taskkill`、in-box PowerShell 与 Windows toast，POSIX 分支从没在真 POSIX 机器上
+   跑过 —— 一个绿色的 Linux run 证明的东西比它看起来少）、**不配 `setup-node` 的 pnpm 缓存**
+   （本仓库没有 `pnpm-lock.yaml`，没有 lockfile 时缓存步骤会直接失败）。
+   `tests/lamp.browser.mjs` 不入 CI：它需要一个在跑的 Web GUI 与真 Chrome，没有就跳过 ——
+   **跳过不算通过**，所以留在本机跑。
 3. **CHANGELOG**。
 4. **发布到 npm** —— ✅ **已完成（2026-09-13）**：以 `@vanadium-23/dsh-restart@0.1.0` 上线
    （`dsh-restart` 这个名字属于 anweat，只能用 scope 别名；脚本临时改名、发完还原）。
