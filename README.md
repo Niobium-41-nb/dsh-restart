@@ -100,8 +100,8 @@ node --import tsx/esm apps/cli/src/bin.ts plugin --profile web remove dsh-restar
 模型可调用 `dsh_restart_status`，或直接用命令行：
 
 ```bash
-node <PLUGINS>/dsh-restart/lib/agent.js status
-node <PLUGINS>/dsh-restart/lib/agent.js status --json
+node lib/agent.js status
+node lib/agent.js status --json
 ```
 
 ### 3. DSH 已经起不来了怎么办
@@ -110,13 +110,13 @@ node <PLUGINS>/dsh-restart/lib/agent.js status --json
 
 ```bash
 # 只回滚配置并重启，不关心原因
-node <PLUGINS>/dsh-restart/lib/agent.js rollback --reason "手动回退坏配置"
+node lib/agent.js rollback --reason "手动回退坏配置"
 
 # 只看状态，不启动任何东西
-node <PLUGINS>/dsh-restart/lib/agent.js status
+node lib/agent.js status
 
 # 普通重启
-node <PLUGINS>/dsh-restart/lib/agent.js restart
+node lib/agent.js restart
 ```
 
 > **⚠ 务必在普通终端窗口里跑，不要跑在 DSH 会话的 shell 里。**
