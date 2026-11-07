@@ -7,6 +7,26 @@
 
 ---
 
+## ✅ 已完成（2026-11-07）：跟上 0.2.x，并支持桌面端
+
+**需求（用户原话）**：「请让该插件支持最新的 deepseek-harness，包括桌面端」「请顺便更新 deepseek-harness」。
+
+- **兼容门禁**：harness 0.2.x 在安装前会读 `engines.dsh`（没有就逐个比对 `@deepseek-ai/dsh-*`
+  的 peer 范围）。原先的 `@deepseek-ai/dsh-tools: ^0.1.5-rc.1` 会让 `dsh plugin add` 整单拒绝；
+  现在声明 `>=0.2.1-rc.5 <0.3.0`，peer 只作参考。
+- **编译期依赖**：harness 已从源码 clone 变成安装态（`app.asar`），旧的 junction 指向不存在的
+  目录；改为从 npm 取 `cordis 4.0.5` / `dsh-tools 0.2.2-rc.1` / `schemastery 3.18.5`。
+- **桌面端**：新增 `surface` 与 `appPid`；桌面端重启 = `taskkill /T` 应用树 + 无参数启动应用，
+  并剔除 `ELECTRON_RUN_AS_NODE`。旧记录（无 `appPid`）与旧 Agent（无 `restart-surfaces`
+  能力）各有一道闸，宁可拒绝也不留下没有窗口的孤儿 Host。设计见 `DESIGN.md` 第 13 节。
+- **真机验证**：0.2.1-rc.5 与 0.2.2-rc.1 各做了一次应用级重启（20s 回来、窗口恢复、报告 `ok`）；
+  256 → 269 项测试全绿（新增桌面端 surface 识别、应用级重启、看门狗桌面分支）。
+- 顺带发现：桌面端自带的更新器在 `D:\Program Files` 下会因**无管理员权限**改名失败
+  （`installer-logs/directory-failure-*`，错误 5），这就是它一直停在旧版本的原因；用安装包
+  以管理员身份静默安装（`/S`）即可。
+
+---
+
 ## ✅ 已完成（2026-09-11）：重启后自动续跑 + 浏览器自恢复
 
 **需求（用户原话）**：「重启后 deepseek-harness 无法自动继续任务，需要人工提醒。希望你可以实现自动化。」

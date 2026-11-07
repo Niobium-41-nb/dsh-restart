@@ -1,6 +1,6 @@
 {
   "name": "dsh-restart",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Out-of-process restart supervisor for DeepSeek Harness: a small control agent on its own port restarts dsh, rolls the profile configuration back to the last known-good snapshot when the new boot fails, and hands the failure report to the restarted harness",
   "repository": {
     "type": "git",
@@ -32,16 +32,18 @@
     "DESIGN.md"
   ],
   "engines": {
-    "node": "^22.19.0 || >=24.0.0"
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.2.1-rc.5 <0.3.0"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-tools": "^0.1.5-rc.1",
-    "@deepseek-ai/schemastery": "^3.18.2"
+    "@deepseek-ai/cordis": "~4.0.5",
+    "@deepseek-ai/dsh-tools": ">=0.2.1-rc.5 <0.3.0",
+    "@deepseek-ai/schemastery": "~3.18.5"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-tools": "^0.1.5-rc.1",
+    "@deepseek-ai/cordis": "~4.0.5",
+    "@deepseek-ai/dsh-tools": ">=0.2.1-rc.5 <0.3.0",
+    "@deepseek-ai/schemastery": "~3.18.5",
     "@types/node": "^22.20.0",
     "tsdown": "^0.22.2",
     "typescript": "^6.0.3"

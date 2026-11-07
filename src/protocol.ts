@@ -9,7 +9,19 @@
  */
 
 /** On-disk schema version for every state file this plugin writes. */
-export const STATE_VERSION = 1
+export const STATE_VERSION = 2
+
+/**
+ * Who owns this harness process, and therefore what "restart it" means.
+ *
+ * `cli` is the familiar case: the harness *is* the process the user launched,
+ * so replaying its command line brings it back. `desktop` means the harness is
+ * the Host child of the DeepSeek Harness desktop application: the command line
+ * belongs to the application, the window belongs to the application, and the
+ * Web port is picked afresh on every boot. Restarting that harness means
+ * restarting the application.
+ */
+export type LaunchSurface = 'cli' | 'desktop'
 
 /** Environment variable naming the control agent's loopback base URL. */
 export const ENV_AGENT_URL = 'DSH_RESTART_AGENT'
@@ -29,6 +41,18 @@ export const ENV_WATCHDOG = 'DSH_RESTART_WATCHDOG'
 /** Environment variable overriding the state directory (defaults under `$DSH_HOME`). */
 export const ENV_STATE_DIR = 'DSH_RESTART_STATE_DIR'
 
+/**
+ * Capability flag an agent advertises when it understands
+ * {@link LaunchSpec.surface}.
+ *
+ * The agent is a long-lived process and the plugin is loaded afresh at every
+ * boot, so upgrading this package can leave a plugin that records desktop
+ * boots talking to an agent that still replays command lines -- which is the
+ * one desktop outcome worse than not restarting: a live harness no window is
+ * attached to, reported as a success.
+ */
+export const AGENT_CAPABILITY_SURFACES = 'restart-surfaces'
+
 /** Everything the agent needs to relaunch the harness exactly as it was launched. */
 export interface LaunchSpec {
   version: number
@@ -45,6 +69,22 @@ export interface LaunchSpec {
   execArgv: string[]
   /** Script and inner arguments (`process.argv.slice(1)`). */
   argv: string[]
+  /**
+   * Who owns this process, and therefore what a relaunch has to spawn.
+   *
+   * Absent on records written before 0.2.0, which are all `cli`.
+   */
+  surface?: LaunchSurface
+  /**
+   * The desktop application's own pid, when {@link LaunchSpec.surface} is
+   * `desktop`.
+   *
+   * The harness is a child of the application, and the application keeps the
+   * window, the single-instance lock, and the URL the window points at. It is
+   * therefore part of what has to be stopped — and it is the process that
+   * shows the "startup failed" dialog the moment its Host exits on its own.
+   */
+  appPid?: number
   /** Environment captured at plugin apply time; empty when capture is disabled. */
   env: Record<string, string>
   /** Loopback URL whose answer proves the HTTP surface is up, when known. */
@@ -264,11 +304,20 @@ export interface AgentStatus {
   version: number
   agent: AgentInfo
   busy: boolean
+  /** What this agent's code knows how to do; see {@link AGENT_CAPABILITY_SURFACES}. */
+  capabilities?: string[]
   current?: { id: string; phase: string; startedAt: string }
   /** Instance the agent would restart by default. */
   instance?: string
   /** Every instance that has registered a launch specification. */
-  instances?: { key: string; pid: number; cwd: string; startedAt: string; alive: boolean }[]
+  instances?: {
+    key: string
+    pid: number
+    cwd: string
+    startedAt: string
+    alive: boolean
+    surface?: LaunchSurface
+  }[]
   /** PID currently tracked as the live harness, when one is known. */
   trackedPid?: number
   trackedPidAlive?: boolean

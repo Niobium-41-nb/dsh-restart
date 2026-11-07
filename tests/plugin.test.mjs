@@ -67,6 +67,9 @@ const agentServer = createServer((request, response) => {
       return json(200, {
         version: 1,
         busy: agentState.busy,
+        // An agent built from this source advertises the surface capability;
+        // scenarios that need an older one take it away.
+        capabilities: agentState.capabilities ?? ['restart-surfaces'],
         ...(agentState.lastReport === undefined ? {} : { lastReport: agentState.lastReport }),
       })
     }
@@ -782,6 +785,95 @@ process.stdout.write('\nthe wake-up waits for the supervisor\'s verdict\n')
     text.includes('restart_status_json: "rolled-back"'), text.slice(0, 220))
   ok('it carries the settled headline', text.includes('the configuration was rolled back'))
   ok('it flags the rollback', text.includes('restart_rolled_back_configuration: true'), text.slice(0, 320))
+}
+
+process.stdout.write('\nthe desktop application owns its Host\n')
+{
+  // The desktop application runs the same profile tree in a child of its own,
+  // and the command line that child carries is the application's private
+  // protocol. Replaying it would start a harness no window is attached to.
+  const desktopEntry = join(stateDir, 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'lib', 'index.js')
+  const cliEntry = join(stateDir, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+  const argvBackup = process.argv.slice()
+  const sendBackup = Object.getOwnPropertyDescriptor(process, 'send')
+  const nodeModeBackup = process.env.ELECTRON_RUN_AS_NODE
+
+  const setBoot = ({ entry, ipc, nodeMode }) => {
+    process.argv[1] = entry
+    Object.defineProperty(process, 'send', { value: ipc ? () => true : undefined, configurable: true })
+    if (nodeMode) process.env.ELECTRON_RUN_AS_NODE = '1'
+    else delete process.env.ELECTRON_RUN_AS_NODE
+  }
+  const restoreBoot = () => {
+    process.argv.splice(0, process.argv.length, ...argvBackup)
+    if (sendBackup === undefined) delete process.send
+    else Object.defineProperty(process, 'send', sendBackup)
+    if (nodeModeBackup === undefined) delete process.env.ELECTRON_RUN_AS_NODE
+    else process.env.ELECTRON_RUN_AS_NODE = nodeModeBackup
+  }
+
+  const { detectSurface } = await import('../src/index.ts')
+
+  setBoot({ entry: cliEntry, ipc: true, nodeMode: true })
+  ok('the bundled dsh CLI is not a desktop boot', detectSurface().surface === 'cli',
+    JSON.stringify(detectSurface()))
+  setBoot({ entry: desktopEntry, ipc: false, nodeMode: true })
+  ok('a Host started by hand has no application to restart', detectSurface().surface === 'cli',
+    JSON.stringify(detectSurface()))
+  setBoot({ entry: desktopEntry, ipc: true, nodeMode: false })
+  ok('without the Node-mode marker it is not the application either', detectSurface().surface === 'cli')
+  setBoot({ entry: desktopEntry, ipc: true, nodeMode: true })
+  const desktop = detectSurface()
+  const appPid = process.ppid
+  ok('the application spawns its Host over an IPC channel', desktop.surface === 'desktop')
+  ok('and the pid it acts on is the one that spawned this Host', desktop.appPid === appPid,
+    JSON.stringify(desktop))
+
+  // Mount as the application's Host, with a Web surface: what gets recorded,
+  // and what the restart asks for, both change.
+  setBoot({ entry: desktopEntry, ipc: true, nodeMode: true })
+  const host = makeHost({ web: true })
+  const original = process.stderr.write
+  const logged = []
+  process.stderr.write = (chunk) => { logged.push(String(chunk)); return true }
+  apply(host.ctx, { ...SILENT })
+  const tool = host.tools.find(candidate => candidate.name === 'dsh_restart')
+  const result = await tool.execute({ reason: 'desktop restart' })
+
+  const instanceKeyOnDisk = readdirSync(join(stateDir, 'instances'))[0]
+  const recorded = JSON.parse(readFileSync(join(stateDir, 'instances', instanceKeyOnDisk, 'launch.json'), 'utf8'))
+  ok('the restart was accepted', result.accepted === true)
+  ok('the launch record says which surface this boot is', recorded.surface === 'desktop', JSON.stringify(recorded.surface))
+  ok('and names the application that owns it', recorded.appPid === appPid, JSON.stringify(recorded.appPid))
+  const desktopRequest = received.at(-1)
+  ok('a desktop relaunch replays no web arguments', desktopRequest.appendArgs === undefined,
+    JSON.stringify(desktopRequest.appendArgs))
+  ok('and the plugin says so to the model', logged.join('').includes('so a restart replaces the application'),
+    logged.join('').slice(0, 300))
+
+  // An agent older than this plugin only knows command lines. Replaying a Host
+  // command line is the one desktop outcome worse than not restarting, so the
+  // request is refused while that agent is busy.
+  agentState.capabilities = []
+  agentState.busy = true
+  const staleHost = makeHost({ web: true })
+  process.stderr.write = (chunk) => { logged.push(String(chunk)); return true }
+  apply(staleHost.ctx, { ...SILENT })
+  const staleTool = staleHost.tools.find(candidate => candidate.name === 'dsh_restart')
+  const staleResult = await staleTool.execute({ reason: 'desktop restart against an old agent' })
+  process.stderr.write = original
+  ok('an agent that predates surfaces is not handed a desktop restart', staleResult.accepted === false,
+    JSON.stringify(staleResult))
+  ok('and the refusal says what to do',
+    String(staleResult.message).includes('predates desktop-application restarts'), staleResult.message)
+  agentState.capabilities = undefined
+  agentState.busy = false
+  restoreBoot()
+
+  // Leave the record the way the following scenarios expect it.
+  delete recorded.surface
+  delete recorded.appPid
+  writeFileSync(join(stateDir, 'instances', instanceKeyOnDisk, 'launch.json'), `${JSON.stringify(recorded, null, 2)}\n`)
 }
 
 agentServer.close()

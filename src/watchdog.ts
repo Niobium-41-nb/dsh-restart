@@ -35,10 +35,13 @@ import { SPAWN_COMMAND, fetchStatus, readAgentInfo } from './agent-client.ts'
 import { ensureDir, isFile, makeId, nowIso, readJson, sleep } from './fsx.ts'
 import { instancePaths, resolveStateDir, statePaths, type StatePaths } from './paths.ts'
 import { readLatestReport, rewriteReport } from './reports.ts'
-import { isAlive } from './agent/process-control.ts'
+import {
+  desktopRelaunchTarget, isDesktopLaunch, type RelaunchTarget, withoutNodeModeEnv,
+} from './relaunch.ts'
+import { forceKill, isAlive } from './agent/process-control.ts'
 
 /** Version reported in the watchdog's own log lines. */
-export const WATCHDOG_VERSION = '0.1.0'
+export const WATCHDOG_VERSION = '0.2.0'
 
 /** Default window to wait for somebody else to bring the harness back. */
 const DEFAULT_WAIT_MS = 120_000
@@ -224,37 +227,65 @@ function relaunch(options: {
     log(`the recorded interpreter ${spec.execPath} is missing; refusing to guess`)
     return undefined
   }
-  const argv = [...spec.execArgv, ...spec.argv]
-  // Same rule the agent follows: a supervised Web relaunch must not open a
-  // second browser tab, and the flag is only ever added for a Web surface.
-  if (spec.webSurface === true && !argv.includes('--no-open')) argv.push('--no-open')
+  let target: RelaunchTarget
+  if (isDesktopLaunch(spec)) {
+    // The application owns the window and the single-instance lock, so a live
+    // one swallows this launch instead of replacing what died. Take it down
+    // before starting it again.
+    if (spec.appPid !== undefined && isAlive(spec.appPid)) {
+      log(`the desktop application (pid ${String(spec.appPid)}) is still up; stopping it before relaunch`)
+      forceKill(spec.appPid, log)
+    }
+    target = desktopRelaunchTarget(spec)
+  } else {
+    const argv = [...spec.execArgv, ...spec.argv]
+    // Same rule the agent follows: a supervised Web relaunch must not open a
+    // second browser tab, and the flag is only ever added for a Web surface.
+    if (spec.webSurface === true && !argv.includes('--no-open')) argv.push('--no-open')
+    target = { execPath: spec.execPath, invocation: argv, cwd: spec.cwd, desktop: false }
+  }
   const outputFile = join(paths.logs, `${makeId('watchdog-relaunch')}.log`)
   ensureDir(paths.logs)
   let child
   try {
     const fd = openSync(outputFile, 'a')
-    child = spawn(spec.execPath, argv, {
-      cwd: spec.cwd,
+    child = spawn(target.execPath, target.invocation, {
+      cwd: target.cwd,
       detached: true,
       stdio: ['ignore', fd, fd],
-      windowsHide: true,
+      windowsHide: !target.desktop,
       // The captured environment when there is one, so the restart really is
       // "the same command line in the same world"; otherwise whatever this
       // process inherited. Either way the stamp below marks who started it.
       env: {
-        ...(Object.keys(spec.env ?? {}).length > 0 ? spec.env : process.env),
+        ...targetEnvironment(spec, target.desktop),
         [ENV_WATCHDOG]: String(pid),
       },
     })
   } catch (error) {
-    log(`could not start ${spec.execPath}: ${error instanceof Error ? error.message : String(error)}`)
+    log(`could not start ${target.execPath}: ${error instanceof Error ? error.message : String(error)}`)
     return undefined
   }
   child.unref()
-  log(`relaunched ${spec.execPath} ${argv.join(' ')} (cwd ${spec.cwd}) as pid ${String(child.pid ?? 0)} `
-    + `for "${options.reason}"; its output goes to ${outputFile}`)
+  log(`relaunched ${target.execPath} ${target.invocation.join(' ')} (cwd ${target.cwd}) as pid `
+    + `${String(child.pid ?? 0)} for "${options.reason}"; its output goes to ${outputFile}`)
   finalizeReport(paths, log, child.pid, spec)
   return child.pid
+}
+
+/** The environment a replacement starts with: the captured one when there is one. */
+function targetEnvironment(spec: LaunchSpec, desktop: boolean): Record<string, string> {
+  const captured = Object.keys(spec.env ?? {}).length > 0
+    ? spec.env as Record<string, string>
+    : asEnvironment(process.env)
+  // The application is not a Node interpreter, and the Host's environment says
+  // that it is; see `relaunch.ts`.
+  return desktop ? withoutNodeModeEnv(captured) : captured
+}
+
+/** Narrow the ambient environment to the shape a captured one has. */
+function asEnvironment(env: NodeJS.ProcessEnv): Record<string, string> {
+  return Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined))
 }
 
 /**

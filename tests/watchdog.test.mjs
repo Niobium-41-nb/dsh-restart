@@ -18,7 +18,7 @@
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -70,7 +70,19 @@ function writeSpec(state, spec) {
     argv: spec.argv,
     env: spec.env ?? {},
     webSurface: spec.webSurface ?? false,
+    ...(spec.surface === undefined ? {} : { surface: spec.surface }),
+    ...(spec.appPid === undefined ? {} : { appPid: spec.appPid }),
   }, null, 2)}\n`)
+}
+
+/** Whether a pid still names a live process. */
+const pidAlive = (pid) => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /** Point the state directory at a fake control agent. */
@@ -312,6 +324,72 @@ process.stdout.write('\na command line it cannot trust\n')
   ok('a missing --instance is refused', code === 2, `code ${String(code)}`)
   ok('and it prints usage instead of guessing', stderr.includes('--instance is required'), stderr.slice(0, 200))
   ok('nothing was written to the state directory', !readdirSync(state.root).includes('logs'))
+}
+
+process.stdout.write('\na desktop boot is relaunched as the application\n')
+{
+  // The Host's command line is the application's private protocol — a runtime
+  // directory, a profile directory, a package-manager path. Replaying it would
+  // start a harness no window is attached to, which is precisely the incident
+  // this process exists to prevent.
+  const state = makeState()
+  const record = join(state.root, 'app-started.json')
+  const preload = join(state.root, 'fake-app.cjs')
+  writeFileSync(preload, [
+    "const { writeFileSync } = require('node:fs')",
+    `writeFileSync(${JSON.stringify(record)}, JSON.stringify({`,
+    '  argv: process.argv.slice(1),',
+    '  nodeMode: process.env.ELECTRON_RUN_AS_NODE ?? null,',
+    '  cwd: process.cwd(),',
+    '}))',
+  ].join('\n'))
+  const pid = await deadPid()
+  // A live application swallows this launch through Electron's single-instance
+  // lock, so it has to be taken down before it is started again.
+  const app = spawn(process.execPath, ['-e', 'setInterval(() => {}, 60000)'], { stdio: 'ignore' })
+  writeSpec(state, {
+    pid,
+    argv: [
+      join(state.root, 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'lib', 'index.js'),
+      join(state.root, 'runtime'),
+      state.root,
+    ],
+    env: { ELECTRON_RUN_AS_NODE: '1', NODE_OPTIONS: `--require ${preload}` },
+    surface: 'desktop',
+    appPid: app.pid,
+  })
+  const server = createServer((request, response) => {
+    const body = JSON.stringify(request.url === '/status' ? { version: 1, busy: false } : { ok: true })
+    response.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) })
+    response.end(body)
+  })
+  await new Promise((resolve) => { server.listen(0, '127.0.0.1', resolve) })
+  writeAgent(state, server.address().port)
+  try {
+    const result = await runWatchdog(state, { pid, silenceMs: 60_000 })
+    let started
+    for (let i = 0; i < 40; i += 1) {
+      try {
+        started = JSON.parse(readFileSync(record, 'utf8'))
+        break
+      } catch {
+        await sleep(100)
+      }
+    }
+    ok('the application is what gets started', started !== undefined, result.log.slice(-400))
+    ok('it stops the live application first', result.log.includes('is still up; stopping it before relaunch'),
+      result.log.slice(-400))
+    ok('and that application is gone', !pidAlive(app.pid))
+    ok('no Host command line is replayed to it', started?.argv?.length === 0, JSON.stringify(started?.argv))
+    ok('and it is not told to behave as a Node interpreter', started?.nodeMode === null,
+      JSON.stringify(started?.nodeMode))
+    ok('it starts from a plain directory, not the profile',
+      started?.cwd?.replaceAll('\\', '/').toLowerCase() === homedir().replaceAll('\\', '/').toLowerCase(),
+      started?.cwd)
+  } finally {
+    server.close()
+    app.kill()
+  }
 }
 
 process.stdout.write(`\n${checks - failures.length}/${checks} checks passed\n`)

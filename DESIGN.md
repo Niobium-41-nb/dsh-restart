@@ -499,3 +499,70 @@ headline: The first boot failed (the process exited with code 1); the configurat
 restored: [ '<DSH_HOME>\\profiles\\restart-lab\\cordis.patch.yml' ]
 attempts: #1 exited | #2 ready (rolled back)
 ```
+
+## 13. 桌面端：重启的单位是应用
+
+### 13.1 进程模型（实测，0.2.1-rc.5 / 0.2.2-rc.1 相同）
+
+```
+DeepSeek Harness.exe                      Electron 主进程：BrowserWindow、单实例锁、更新
+   │  spawn(node, ['--expose-internals', .../dsh-desktop-host/lib/index.js,
+   │              runtimeDir, profileDir, primaryRuntime, pnpm, nodeBin],
+   │        { cwd: profileDir, stdio: [..., 'ipc'], env: {...process.env, ELECTRON_RUN_AS_NODE: '1'} })
+   ▼
+DeepSeek Harness.exe --expose-internals …（Host，同一个 exe 的 Node 模式）
+   │  runProfile({ args: ['--no-open', '--host', '127.0.0.1', '--port', '0'] })
+   ▼
+desktop profile（harness 树；Web 面绑随机端口）
+```
+
+三条推论决定了实现：
+
+1. **Host 的命令行是应用的私有协议**（runtime 目录、profile 目录、pnpm 路径），不是可以重放的
+   "用户命令行"。重放它起得来，但那个 harness 没有窗口——而报告会说成功。这比不重启更糟。
+2. **端口每次都是随机的**（`--port 0`），URL 只有 Electron 知道。任何"只重启 Host"的方案都会
+   让窗口指向一个死端口。
+3. **Host 退出会触发应用的启动失败对话框**（`main.js` 里 `close` 事件无条件 `fail(...)`，
+   除非是应用自己发起的 shutdown）。所以停 Host 的动作必须和应用一起完成。
+
+### 13.2 surface 的识别
+
+插件在 `apply` 时判断自己是谁的进程（`detectSurface`）：
+
+| 条件 | 结论 |
+|---|---|
+| argv[1] 是 `@deepseek-ai/dsh-desktop-host/lib/index.js` | 候选 Host |
+| 且 `process.send !== undefined`（应用用 `stdio: [..., 'ipc']` 拉起 Host） | 确定是 Host |
+| 且 `ELECTRON_RUN_AS_NODE === '1'` | 应用托管 |
+| 且 `process.ppid` 是合法父进程 | `surface: 'desktop'`，`appPid = process.ppid` |
+
+缺任何一条都当成 `cli`：手工跑起来的 Host 没有父应用可停，把它当桌面端只会去杀一个无关进程。
+IPC 通道这一条是关键——它是"有人在用 IPC 管我"的直接证据，不是推断。
+
+### 13.3 重启序列
+
+Agent 的 `stopPrevious` 对桌面端走另一条路：先等 Host 自己退出（`stopGraceMs`），
+不退出就 `taskkill /T /F` **应用**（Host 随之消失，对话框也没了）；然后 `relaunchPlan`
+返回 `{ execPath: <应用 exe>, invocation: [], cwd: homedir() }`。
+
+- `invocation` 为空：应用不接受参数，`--no-open` 也不是给它的。
+- cwd 用 `homedir()`：Host 的 cwd 是 profile 目录，拿它当应用的 cwd 会把"默认工作区"指错。
+- 环境里剔除 `ELECTRON_RUN_AS_NODE`：Host 的环境带着它，原样交给 exe 会让应用以 Node 身份启动
+  （无窗口，退出码 9）。
+
+`src/relaunch.ts` 是 Agent 和看门狗共用的唯一实现，避免两边对"桌面端怎么重启"给出不同答案。
+
+### 13.4 旧记录与旧 Agent
+
+两种版本错配都会把桌面端重启变成"孤儿 Host"，所以各有一道闸：
+
+- **记录里是桌面形态但没有 `appPid`**（旧插件写的）：Agent 拒绝并说明原因，不重放命令行。
+  `desktopShapedRecord` 只看 argv[0]，不依赖 `surface` 字段。
+- **Agent 是旧代码**（插件升级后它还在跑）：新插件的 `/status` 里找 `capabilities`；
+  没有 `restart-surfaces` 时，空闲的 Agent 会被请退场、换一个新的；正在忙则拒绝本次请求。
+
+### 13.5 不做什么
+
+- 不尝试"只重启 Host 再让窗口换 URL"：没有公开的宿主→Electron 通道。
+- 不在桌面端追加 `--no-open`：窗口是应用开的，这条开关只属于 Web app 的命令行。
+- 不把桌面端的窗口当作重启成功的证据：成功只看新 Host 的 `/ready`，窗口标题是外部观察。

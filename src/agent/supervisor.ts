@@ -18,7 +18,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { closeSync, openSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import {
-  ENV_AGENT_TOKEN, ENV_AGENT_URL, ENV_ATTEMPT, ENV_STATE_DIR, STATE_VERSION,
+  AGENT_CAPABILITY_SURFACES, ENV_AGENT_TOKEN, ENV_AGENT_URL, ENV_ATTEMPT, ENV_STATE_DIR, STATE_VERSION,
   type AgentInfo, type AgentStatus, type AttemptOutcome, type AttemptResult, type LaunchSpec,
   type RestartReport, type RestartRequest, type RollbackRecord, type TrackedFiles,
 } from '../protocol.ts'
@@ -28,10 +28,22 @@ import {
 import type { StatePaths, InstancePaths } from '../paths.ts'
 import { instancePaths } from '../paths.ts'
 import { readBaselineManifest, restoreBaseline } from '../snapshot.ts'
-import { isAlive, probeHttp, stopProcess } from './process-control.ts'
+import {
+  desktopRelaunchTarget, desktopShapedRecord, isDesktopLaunch, type RelaunchTarget, withoutNodeModeEnv,
+} from '../relaunch.ts'
+import { forceKill, isAlive, probeHttp, stopProcess } from './process-control.ts'
 
 /** How many reports stay on disk. */
 const REPORT_HISTORY_LIMIT = 30
+
+/**
+ * How long the desktop application is allowed to take dying.
+ *
+ * A second instance folds into a live one through Electron's single-instance
+ * lock and then closes, so relaunching over an application that has not
+ * finished exiting raises a window that immediately goes away.
+ */
+const DESKTOP_APP_LOCK_RELEASE_MS = 5_000
 
 /** One registered harness surface. */
 interface InstanceRecord {
@@ -154,6 +166,7 @@ export class Supervisor {
       version: STATE_VERSION,
       agent: this.options.agentInfo,
       busy: this.busy,
+      capabilities: [AGENT_CAPABILITY_SURFACES],
       trackedFiles: tracked?.files ?? [],
       instances: instances.map(record => ({
         key: record.key,
@@ -161,6 +174,7 @@ export class Supervisor {
         cwd: record.launch.cwd,
         startedAt: record.launch.startedAt,
         alive: isAlive(record.launch.pid),
+        ...(record.launch.surface === undefined ? {} : { surface: record.launch.surface }),
       })),
     }
     if (resolved !== undefined) status.instance = resolved.key
@@ -362,6 +376,22 @@ export class Supervisor {
     const logFile = join(this.options.paths.logs, `${id}-attempt${String(attempt)}.log`)
     ensureDir(this.options.paths.logs)
 
+    // A desktop boot whose record names no application is not something this
+    // agent may act on: replaying the Host command line boots a harness no
+    // window is attached to, and reporting that as a success is worse than
+    // refusing. It happens when the record predates surface tracking -- the
+    // application has to boot once with the new plugin before it can be
+    // restarted by it.
+    if (desktopShapedRecord(launch) && launch.appPid === undefined) {
+      return this.finishAttempt({
+        attempt, startedAt, startedAtIso, logFile, usedRollback, pid: undefined,
+        result: 'spawn-error',
+        note: 'this is the desktop application\'s Host, but its record does not name the application to '
+          + 'restart; relaunching the Host command line would leave the window attached to nothing. '
+          + 'Start the application again (it records what it owns on the next boot) and retry.',
+      })
+    }
+
     this.setPhase(`attempt ${attempt}: stopping the previous process`)
     await this.stopPrevious(request, launch, stopGraceMs)
 
@@ -370,28 +400,22 @@ export class Supervisor {
 
     this.setPhase(`attempt ${attempt}: starting dsh`)
     const environment = this.childEnvironment(launch, attemptId)
-    // The relaunch args are the recorded command line plus the arguments a
-    // supervised boot needs. A restarted Web surface must not pop a second
-    // browser tab, so `--no-open` is appended — either because the requester
-    // asked for it, or, when nobody asked (a restart started from the command
-    // line has no plugin to ask), because the boot that recorded the launch
-    // spec had a Web surface mounted.
-    const appendArgs = request.appendArgs ?? (
-      launch.webSurface === true && !launch.argv.includes('--no-open') ? ['--no-open'] : []
+    const plan = this.relaunchPlan(launch, request)
+    this.options.log(
+      `attempt ${attempt}: ${plan.execPath} ${plan.invocation.join(' ')} (cwd ${plan.cwd}, `
+      + `${plan.desktop ? 'desktop application' : 'harness command line'})`,
     )
-    const invocation = [...launch.execArgv, ...launch.argv, ...appendArgs]
-    this.options.log(`attempt ${attempt}: ${launch.execPath} ${invocation.join(' ')} (cwd ${launch.cwd})`)
 
     let spawnError: Error | undefined
     let exit: { code: number | null; signal: NodeJS.Signals | null } | undefined
     let child: ChildProcess
     const logFd = openSync(logFile, 'a')
     try {
-      child = spawn(launch.execPath, invocation, {
-        cwd: launch.cwd,
+      child = spawn(plan.execPath, plan.invocation, {
+        cwd: plan.cwd,
         env: environment,
         stdio: ['ignore', logFd, logFd],
-        windowsHide: true,
+        windowsHide: !plan.desktop,
       })
     } catch (error) {
       closeSync(logFd)
@@ -450,10 +474,46 @@ export class Supervisor {
       await stopProcess(leftover.pid, 1_500, this.options.log)
     }
     const tracked = request.pid ?? launch.pid
-    if (isAlive(tracked)) {
-      this.options.log(`waiting up to ${stopGraceMs} ms for pid ${tracked} to shut down`)
-      await stopProcess(tracked, stopGraceMs, this.options.log)
+    const desktop = isDesktopLaunch(launch)
+
+    if (!desktop || launch.appPid === undefined) {
+      if (isAlive(tracked)) {
+        this.options.log(`waiting up to ${stopGraceMs} ms for pid ${tracked} to shut down`)
+        await stopProcess(tracked, stopGraceMs, this.options.log)
+      }
+      if (desktop) {
+        this.options.log('this desktop boot recorded no application pid, so only its Host was stopped; '
+          + 'the application is left holding its own "startup failed" dialog')
+      }
+      return
     }
+    const appPid = launch.appPid
+
+    // A desktop shutdown waits for the Host first, because the cooperative path
+    // is the plugin inside it exiting on its own — and the moment the Host is
+    // gone the application starts asking the user what to do about it. That
+    // modal is the application's own, so it only leaves with the application.
+    const graceDeadline = Date.now() + Math.max(0, stopGraceMs)
+    while (Date.now() < graceDeadline && isAlive(tracked)) await sleep(120)
+    if (isAlive(tracked)) {
+      this.options.log(`pid ${tracked} is still running after ${stopGraceMs} ms; taking down the application instead`)
+    }
+    // One tree kill removes both, which is also what leaves no dialog standing.
+    // Nothing asks the application to quit — it is not the process that owns
+    // the harness's cooperative shutdown — so waiting for one is waiting for a
+    // timer, not for a favour.
+    if (isAlive(appPid)) {
+      this.options.log(`stopping the desktop application (pid ${String(appPid)}) that hosts this harness`)
+      forceKill(appPid, this.options.log)
+    }
+    if (isAlive(tracked)) {
+      this.options.log(`pid ${tracked} outlived its application; terminating it on its own`)
+      forceKill(tracked, this.options.log)
+    }
+    // The next instance folds into a live one through the single-instance lock,
+    // so the application has to be provably gone before it is started again.
+    const lockDeadline = Date.now() + DESKTOP_APP_LOCK_RELEASE_MS
+    while (Date.now() < lockDeadline && isAlive(appPid)) await sleep(120)
   }
 
   private childEnvironment(launch: LaunchSpec, attemptId: string): Record<string, string> {
@@ -462,7 +522,11 @@ export class Supervisor {
       : Object.fromEntries(
         Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
       )
-    const environment: Record<string, string> = { ...captured }
+    // A desktop relaunch hands the environment back to the application, not to
+    // its Host, and the Host's copy says "behave like Node".
+    const environment: Record<string, string> = isDesktopLaunch(launch)
+      ? withoutNodeModeEnv(captured)
+      : { ...captured }
     // Never inherit a stale handshake: this attempt's identity is the only one
     // the supervisor will accept.
     delete environment[ENV_ATTEMPT]
@@ -473,6 +537,34 @@ export class Supervisor {
     environment[ENV_ATTEMPT] = attemptId
     environment[ENV_STATE_DIR] = this.options.paths.root
     return environment
+  }
+
+  /**
+   * What to spawn -- and from where -- to bring this instance back.
+   *
+   * A desktop boot is the application's problem; see `relaunch.ts`. Otherwise
+   * the relaunch args are the recorded command line plus the arguments a
+   * supervised boot needs. A restarted Web surface must not pop a second
+   * browser tab, so `--no-open` is appended — either because the requester
+   * asked for it, or, when nobody asked (a restart started from the command
+   * line has no plugin to ask), because the boot that recorded the launch spec
+   * had a Web surface mounted.
+   *
+   * @param launch - the recorded specification of the process being replaced.
+   * @param request - the restart request, whose explicit args win.
+   * @returns the executable, its arguments, and the working directory.
+   */
+  private relaunchPlan(launch: LaunchSpec, request: RestartRequest): RelaunchTarget {
+    if (isDesktopLaunch(launch)) return desktopRelaunchTarget(launch)
+    const appendArgs = request.appendArgs ?? (
+      launch.webSurface === true && !launch.argv.includes('--no-open') ? ['--no-open'] : []
+    )
+    return {
+      execPath: launch.execPath,
+      invocation: [...launch.execArgv, ...launch.argv, ...appendArgs],
+      cwd: launch.cwd,
+      desktop: false,
+    }
   }
 
   /** Wait for a readiness signal, a fallback health probe, an exit, or the deadline. */

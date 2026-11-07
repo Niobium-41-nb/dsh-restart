@@ -2,12 +2,15 @@
 
 [![check](https://github.com/Niobium-41-nb/dsh-restart/actions/workflows/check.yml/badge.svg)](https://github.com/Niobium-41-nb/dsh-restart/actions/workflows/check.yml) [![npm](https://img.shields.io/npm/v/%40vanadium-23%2Fdsh-restart)](https://www.npmjs.com/package/@vanadium-23/dsh-restart) [![license](https://img.shields.io/github/license/Niobium-41-nb/dsh-restart)](https://github.com/Niobium-41-nb/dsh-restart/blob/master/LICENSE)
 
-给 DeepSeek Harness 用的**进程外重启插件**。
+给 DeepSeek Harness 用的**进程外重启插件**。命令行 profile 与**桌面端应用**都支持。
 
 装插件、改 `cordis.patch.yml`、动 `package.json` 之后，DSH 需要重启才能生效；重启本身又最容易出事——
 一个写错的 patch 行会让整棵树起不来，而"起不来"的进程没法自救。这个插件把重启这件事交给一个
 **独立的、不在 DSH 进程树里的小型控制 Agent**：它替你停进程、按原样的命令行重新拉起、盯着新进程
 有没有真的起来；起不来就**回滚到上一次成功启动时的配置**再启一次，并把报错写下来交给重启后的 DSH。
+
+命令行 profile 里"原样重新拉起"就是重放同一条命令行；桌面端里 harness 是应用的一个子进程，
+窗口、端口和单实例锁都归应用所有，所以那里的重启单位是**整个应用**（见「桌面端」一节）。
 
 ```
 ┌──────────────────────────── DSH 进程（会被重启的那个） ────────────────────────────┐
@@ -38,10 +41,24 @@
 
 ## 安装
 
+要求 harness `>=0.2.1-rc.5 <0.3.0`（`package.json` 里用 `engines.dsh` 声明）。装、卸都走
+profile 的包管理，插件的客户端半边会顺带进启动图。
+
+**桌面端（`desktop` profile）**——必须用安装目录自带的 CLI，并且**先完全退出应用**
+（profile 由应用初始化，npm 版 `dsh` 会拒绝管理它）：
+
 ```bash
-# 在 DSH 源码目录（<HARNESS>）执行
-node --import tsx/esm apps/cli/src/bin.ts plugin --profile web add file:<PLUGINS>/dsh-restart
+# 先退出 DeepSeek Harness（托盘也要退），再执行：
+"<DSH_INSTALL>\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add file:<PLUGINS>/dsh-restart
 ```
+
+**命令行 profile（`web` / `tui` / 自建）**：
+
+```bash
+dsh plugin --profile web add file:<PLUGINS>/dsh-restart
+```
+
+`<DSH_INSTALL>` 是桌面应用的安装目录（本机为 `D:\Program Files\deepseek-harness`）。
 
 `dsh-restart` 的 `package.json` 里声明了 `dsh.bundle.patch`，所以 `dsh plugin add` 会把它
 自动追加进 `dsh.profile.bundles`，**不需要**再手写 `cordis.patch.yml` 的 insert 行
@@ -52,8 +69,48 @@ node --import tsx/esm apps/cli/src/bin.ts plugin --profile web add file:<PLUGINS
 卸载：
 
 ```bash
-node --import tsx/esm apps/cli/src/bin.ts plugin --profile web remove dsh-restart
+dsh plugin --profile web remove dsh-restart      # 命令行 profile
+"<DSH_INSTALL>\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop remove dsh-restart   # 桌面端，同样先退出应用
 ```
+
+> 版本门禁：harness 在安装**之前**会读插件 `package.json` 的 `engines.dsh`（没有就逐个比对
+> `@deepseek-ai/dsh-*` 的 peer 范围），不匹配就整单拒绝并提示 `dsh plugin allow-version … --accept-risk`。
+> 升级 harness 后如果不想立刻信这个插件，就让它被拒绝，而不是随手放行。
+
+## 桌面端
+
+**重启单位是整个应用。** 桌面端里 harness 不是用户启动的那个进程，而是应用的 Host 子进程：
+
+```
+DeepSeek Harness.exe（Electron 主进程：窗口、单实例锁、更新）
+   └── DeepSeek Harness.exe --expose-internals …\dsh-desktop-host\lib\index.js …（Host，stdio 里带 ipc）
+          └── desktop profile（harness 树，Web 面绑 127.0.0.1 的随机端口）
+```
+
+所以插件记录 `launch.json` 时多写两件事：`surface: 'desktop'` 和 `appPid`（Host 的父进程，
+也就是 Electron 主进程）。Agent 的重启因此变成：
+
+1. 等 Host 自己退出，最多 `stopGraceMs`——模型触发的重启会走"回合结束再退出"的优雅路径；
+2. 不优雅就 `taskkill /T` **应用**（Host 是它的子进程，一起走）；优雅退出后应用会弹出
+   "startup failed" 对话框，那也随着应用一起消失；
+3. 以**无参数**方式启动 `DeepSeek Harness.exe`（工作目录用用户主目录），等新 Host 的 `/ready`。
+
+三个"不做"同样是设计的一部分：
+
+- **不重放 Host 的命令行。** 那是应用的私有协议（runtime 目录、profile 目录、pnpm 路径），
+  重放只会得到一个没有窗口的 harness，而报告还会说"成功"。记录里若是桌面形态却**没有** `appPid`，
+  Agent 直接拒绝并说明原因。
+- **不追加 `--no-open`。** 桌面端的窗口是应用自己开的，这条开关只属于 Web app 的命令行。
+- **不把 `ELECTRON_RUN_AS_NODE` 传回去。** Host 的环境里有它（应用用 Node 模式启动 Host）；
+  原样交给 `DeepSeek Harness.exe` 会让应用以 Node 身份启动——没有窗口，退出码 9。
+
+会话续跑、报告回投、配置回滚都和命令行 profile 一样：`desktop` 的配置文件在
+`$DSH_HOME/profiles/desktop/`，实例按 profile 目录单独分桶。侧边栏指示灯也照旧——桌面窗口
+加载的是同一套 Web GUI；区别在于重启时整页跟着应用重开，不需要"发现宿主换人再自刷新"。
+
+> 升级本插件后，**已经跑着的控制 Agent 还是旧代码**（它不会热更新）。Agent 会把自己支持的
+> 能力写在 `/status` 里：桌面端的插件发现对方不认识桌面重启时，会先请空闲的 Agent 退场、换一个
+> 当前的；Agent 正在重启时则拒绝这次请求，而不是让旧 Agent 去重放命令行。
 
 ## 用法
 
@@ -77,8 +134,10 @@ node --import tsx/esm apps/cli/src/bin.ts plugin --profile web remove dsh-restar
 这一条是必须的：重启请求本来就发生在**一轮对话中间**，如果按定时器退出，模型的收尾回复会被拦腰砍断，
 重启完回来看到的就是"对话没继续"。
 
-### 重启后的三个行为
+### 重启后的几个行为
 
+- **桌面端重启的是应用本身**：窗口关掉、Host 换新、应用自己重新打开并加载新端口；
+  你不需要去托盘里找它，也不会有第二个窗口（细节见上一节）。
 - **Web 面不会又弹一个浏览器标签页**：受管重启时会在命令行末尾追加 `--no-open`（只在检测到 Web 面已挂载时才加，
   这样 tui / headless 之类的 profile 不会因为不认识的参数起不来）。你本来就在看着要重启的那个页面。
 - **重启结果会回到会话里**：新实例启动时读取上一次的重启报告，打进 stderr、注册成系统提示词里的一段，
@@ -214,6 +273,10 @@ Agent 在**每次拉起进程之前**先把报告写到 `reports/<id>.json`（�
 它**只覆盖优雅重启**：CLI/HTTP 触发的强杀路径上插件已经死了，什么都没派出去；dsh 自己崩溃时
 也没人请求过重启。配置项：`watchdog`（默认开）、`watchdogWaitMs`（默认 120000）。
 
+桌面端它按同一张表判断，只是"拉起来"的含义不同：先看 `launch.json` 里的 `appPid`，应用还活着
+就先把它收掉（否则单实例锁会把新实例折进旧窗口、什么都不恢复），再以无参数方式启动应用；
+`ELECTRON_RUN_AS_NODE` 同样会被剔除。它和 Agent 共用 `src/relaunch.ts`，两边的重启目标不会漂移。
+
 ## 回滚基线（last-known-good）的语义
 
 - 快照**只在一个进程真的提交了启动之后**才写（`ctx.appReady` 回调），所以基线里的配置一定是
@@ -268,14 +331,15 @@ dsh-restart/
 ├── logs/agent.log                # Agent 自己的日志
 ├── reports/<id>.json             # 每次重启的报告（保留最近 30 份）
 └── instances/<key>/              # 每个 DSH 实例一份，互不干扰
-    ├── launch.json               # 原样重启所需的 argv / cwd / env
+    ├── launch.json               # 重启目标：argv/cwd/env，桌面端另有 surface + appPid
     ├── tracked-files.json        # 该实例跟踪哪些配置
     ├── resume.json               # 这次重启是哪个会话提的（新进程据此唤醒它）
     └── last-good/                # 回滚基线（manifest.json + files/）
 ```
 
 <instances> 按 profile 目录哈希分桶：同时开着 web 和 tui 两个 profile 时，一个实例的重启
-不会用错另一个实例的命令行，也不会回滚掉另一个实例的配置。
+不会用错另一个实例的命令行，也不会回滚掉另一个实例的配置；桌面端的 `desktop` profile 同样
+单独一桶，且 `launch.json` 里的 `surface` 说明这次要拉起的是命令行还是整个应用。
 
 ## 安全边界
 
@@ -295,18 +359,23 @@ dsh-restart/
 | `the restart control agent is not running` | 手动 `node lib/agent.js serve`，或确认 3099 端口没被别的程序占着 |
 | 重启后 DSH 没起来，报告是 `failed` | 看 `reports/<id>.json` 里 `attempts[].logFile` 指的日志；用 `rollback` 子命令强制回退 |
 | 报告说 `readiness arrived late` | 启动比 `readyTimeoutMs` 慢，调大它 |
+| 桌面端重启后窗口没回来 | 报告里应有 `desktop application` 的 attempt；没有说明 Agent 是旧代码。`node lib/agent.js stop` 后重试，让新的 Agent 接手 |
+| 桌面端重启被拒绝，说 Agent 不认识桌面重启 | 同上：旧 Agent 且正在忙，等它空下来再试 |
+| `dsh plugin … add` 报 `installation rejected: … incompatible with dsh …` | 插件的 `engines.dsh` 不覆盖当前 harness；升级插件，或明确 `allow-version … --accept-risk` |
+| 桌面端更新一直失败，日志是 `directory-failure` / 错误 5 | 安装目录在 `Program Files` 下而应用没有管理员权限；用安装包（`/S`）以管理员身份装一次 |
 | 想彻底停掉 Agent | `node lib/agent.js stop`，或等 `idleExitMs` 空转退出 |
 
 ## 开发
 
 ```bash
+pnpm install --ignore-scripts                                      # @deepseek-ai/* 从 npm 取（纯编译期类型）
 node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit   # 类型检查
 node node_modules/typescript/bin/tsc -b tsconfig.json            # 编译到 lib/types
 node node_modules/tsdown/dist/run.mjs                            # 打包 lib/index.js + lib/agent.js
-node tests/agent.e2e.mjs                                         # 43 项：Agent 侧（假 harness + CORS 行为）
-node --experimental-strip-types tests/plugin.test.mjs            # 33 项：插件侧（假 Agent HTTP 服务、启动对账、看门狗派发）
-node tests/watchdog.test.mjs                                     # 28 项：看门狗二进制（真的跑它，覆盖六种判定）
-node tests/client.test.mjs                                       # 58 项：客户端指示灯（stub window + slots）
+node tests/agent.e2e.mjs                                         # 52 项：Agent 侧（假 harness、CORS、桌面端应用级重启）
+node --experimental-strip-types tests/plugin.test.mjs            # 92 项：插件侧（假 Agent HTTP 服务、启动对账、看门狗派发、surface 识别）
+node tests/watchdog.test.mjs                                     # 34 项：看门狗二进制（真的跑它，覆盖六种判定 + 桌面端）
+node tests/client.test.mjs                                       # 95 项：客户端指示灯（stub window + slots）
 node tests/lamp.browser.mjs                                      # 25 项：真浏览器里的四种灯态（无 GUI 时跳过）
 ```
 
@@ -317,19 +386,28 @@ node tests/lamp.browser.mjs                                      # 25 项：真�
 （`CHROME_PATH`），没有就跳过 —— 单测和字节比对曾经全绿而灯根本没出现，这个检查就是为
 那件事写的。
 
-`node_modules` 里的 `@deepseek-ai/*` 是指向 `<HARNESS>` 的 junction，仅用于编译期类型。
+`@deepseek-ai/cordis`、`dsh-tools`、`schemastery` 只用于编译期类型与 `defineTool` 的类型推断，
+版本跟随安装态 harness（当前 0.2.2-rc.1 / cordis 4.0.5 / dsh-tools 0.2.2-rc.1）。
+以前那种"指向 harness 源码的 junction"已经不用了：harness 现在是安装态，源码在
+`app.asar` 里，包从 npm 取同版本即可。
 
-**改完代码要让 profile 用上新构建**：pnpm 对 `file:` 依赖是按内容快照安装的，直接再跑一次
-`add` 会说 "Already up to date" 而不重新拷贝。必须 remove 再 add：
+**改完代码要让 profile 用上新构建**：pnpm 对 `file:` 依赖是按内容快照安装的（装进 profile
+的是拷贝，不是链接），直接再跑一次 `add` 会说 "Already up to date" 而不重新拷贝。必须
+remove 再 add，桌面端还要先完全退出应用：
 
 ```bash
-node --import tsx/esm apps/cli/src/bin.ts plugin --profile web remove dsh-restart
-node --import tsx/esm apps/cli/src/bin.ts plugin --profile web add file:<PLUGINS>/dsh-restart
+# 命令行 profile
+dsh plugin --profile web remove dsh-restart
+dsh plugin --profile web add file:<PLUGINS>/dsh-restart
+
+# 桌面端
+"<DSH_INSTALL>\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop remove dsh-restart
+"<DSH_INSTALL>\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add file:<PLUGINS>/dsh-restart
 ```
 
-改的只是 Agent 侧（`lib/agent.js`）时不需要重装：Agent 是每次按需从
-`instances/<key>` 旁边的入口拉起的，重启 DSH 后新进程会用新代码。
-插件侧（`lib/index.js`）必须走上面的重装流程 + 一次重启。
+改的只是 Agent 侧（`lib/agent.js`）时不需要重装，**但已经在跑的 Agent 不会热更新**：它按需
+从磁盘拉起，下一次由新进程重启时才会用新代码；要立刻换掉就 `node lib/agent.js stop`，
+下一次请求会拉起当前的。插件侧（`lib/index.js`）必须走上面的重装流程 + 一次重启。
 
 接下来要做什么，见 [ROADMAP.md](ROADMAP.md)；工作区级的硬规则与验证手册见 `../AGENTS.md`。
 

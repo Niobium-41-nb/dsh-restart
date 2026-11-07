@@ -12,6 +12,7 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -386,6 +387,110 @@ try {
   const agentSource = readFileSync(agentEntry, 'utf8')
   check('agent.js does not import @deepseek-ai', !agentSource.includes('@deepseek-ai'))
   check('agent.js exists', existsSync(agentEntry))
+
+  // ── test 8: a desktop boot restarts its application ─────────────────────
+  process.stdout.write('\ntest 8 — the desktop Host is restarted as the application that owns it\n')
+  {
+    // The application owns the window, the port and the single-instance lock,
+    // and the Host's command line is its private protocol. A restart has to
+    // start the application bare -- and must not hand back the environment
+    // marker that makes that executable behave as a plain Node interpreter.
+    const appRecord = join(stateDir, 'desktop-app-started.json')
+    const appPreload = join(stateDir, 'fake-desktop-app.cjs')
+    writeFileSync(appPreload, `
+const { writeFileSync } = require('node:fs')
+writeFileSync(${JSON.stringify(appRecord)}, JSON.stringify({
+  argv: process.argv.slice(1),
+  nodeMode: process.env.ELECTRON_RUN_AS_NODE ?? null,
+  cwd: process.cwd(),
+}))
+const attempt = process.env.DSH_RESTART_ATTEMPT
+if (attempt !== undefined) {
+  setTimeout(() => {
+    fetch(process.env.DSH_RESTART_AGENT + '/ready', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer ' + process.env.DSH_RESTART_TOKEN },
+      body: JSON.stringify({ attempt }),
+    }).catch(() => {})
+  }, 400)
+}
+// Lives long enough to settle, then leaves on its own so no stray process
+// outlives the run.
+setTimeout(() => process.exit(0), 12_000)
+`)
+    const alive = (pid) => {
+      try {
+        process.kill(pid, 0)
+        return true
+      } catch {
+        return false
+      }
+    }
+    // The running application and its Host, neither of which cooperates: this
+    // is the restart started from the command line, where no plugin exits.
+    const app = spawn(process.execPath, ['-e', 'setInterval(() => {}, 60000)'], { stdio: 'ignore' })
+    const host = spawn(process.execPath, ['-e', 'setInterval(() => {}, 60000)'], { stdio: 'ignore' })
+    writeJson(join(instanceDir, 'launch.json'), launchSpec(
+      { ELECTRON_RUN_AS_NODE: '1', NODE_OPTIONS: `--require ${appPreload}` },
+      {
+        pid: host.pid,
+        surface: 'desktop',
+        appPid: app.pid,
+        argv: [
+          join(stateDir, 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'lib', 'index.js'),
+          join(stateDir, 'runtime'),
+          instanceDir,
+        ],
+      },
+    ))
+    writeFileSync(configPath, 'GOOD\n')
+
+    const desktop = await restart({
+      reason: 'e2e desktop restart', requestedBy: 'e2e', instance: 'e2e',
+      readyTimeoutMs: 15_000, stopGraceMs: 1_000,
+    })
+    check('the desktop restart came up', desktop.body.status === 'ok', JSON.stringify(desktop.body.headline))
+    check('the application confirmed its own startup',
+      desktop.body.attempts?.[0]?.result === 'ready', desktop.body.attempts?.[0]?.result)
+    check('the live application was taken down', !alive(app.pid))
+    check('and so was its Host', !alive(host.pid))
+
+    let started
+    for (let probe = 0; probe < 40 && started === undefined; probe += 1) {
+      try {
+        started = JSON.parse(readFileSync(appRecord, 'utf8'))
+      } catch {
+        await sleep(100)
+      }
+    }
+    check('the application was started with no arguments', started?.argv?.length === 0, JSON.stringify(started?.argv))
+    check('and not told to behave as a Node interpreter', started?.nodeMode === null, JSON.stringify(started?.nodeMode))
+    check('it starts from a plain directory, not the profile',
+      String(started?.cwd ?? '').replaceAll('\\', '/').toLowerCase() === homedir().replaceAll('\\', '/').toLowerCase(),
+      started?.cwd)
+
+    // The next scenario reads the ordinary record again.
+    writeJson(join(instanceDir, 'launch.json'), launchSpec())
+
+    // A record from an older plugin says nothing about the surface, but its
+    // command line is still the application's private protocol. Replaying it
+    // would boot a harness no window is attached to, so it is refused.
+    writeJson(join(instanceDir, 'launch.json'), launchSpec({}, {
+      surface: 'desktop',
+      argv: [join(stateDir, 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'lib', 'index.js')],
+    }))
+    const orphanRisk = await restart({
+      reason: 'e2e desktop record without an application', requestedBy: 'e2e',
+      instance: 'e2e', readyTimeoutMs: 5_000, stopGraceMs: 500,
+    })
+    check('a desktop record without an application is refused', orphanRisk.body.status === 'failed',
+      JSON.stringify(orphanRisk.body.status))
+    check('and the report says why',
+      JSON.stringify(orphanRisk.body).includes('does not name the application'),
+      JSON.stringify(orphanRisk.body.attempts?.[0]?.note))
+
+    writeJson(join(instanceDir, 'launch.json'), launchSpec())
+  }
 } catch (error) {
   failures.push(`harness error: ${error.message}`)
   process.stdout.write(`\nFAIL harness error: ${error.stack}\n`)

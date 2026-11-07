@@ -30,7 +30,7 @@ import { createAgentServer } from './server.ts'
 import { Supervisor } from './supervisor.ts'
 
 /** Version reported by the agent and required in its health document. */
-export const AGENT_VERSION = '0.1.0'
+export const AGENT_VERSION = '0.2.0'
 
 /** Default loopback control port. */
 const DEFAULT_PORT = 3099
@@ -291,7 +291,14 @@ function printLocalState(paths: ReturnType<typeof statePaths>, args: ParsedArgs)
     const instance = instancePaths(paths.root, key)
     return {
       key,
-      launch: readJson<{ pid?: number; cwd?: string; argv?: string[]; startedAt?: string }>(instance.launchSpec),
+      launch: readJson<{
+        pid?: number
+        cwd?: string
+        argv?: string[]
+        startedAt?: string
+        surface?: string
+        appPid?: number
+      }>(instance.launchSpec),
       baseline: readBaselineManifest(instance.lastGood),
       alive: isAlive(readJson<{ pid?: number }>(instance.launchSpec)?.pid ?? 0),
     }
@@ -308,9 +315,12 @@ function printLocalState(paths: ReturnType<typeof statePaths>, args: ParsedArgs)
   process.stdout.write(`  state dir   : ${paths.root}\n`)
   if (instances.length === 0) process.stdout.write('  instances   : none registered\n')
   for (const instance of instances) {
+    const surface = instance.launch?.surface === 'desktop'
+      ? ` [desktop application, pid ${String(instance.launch.appPid ?? 0)}]`
+      : ''
     process.stdout.write(
       `  instance    : ${instance.key} pid ${String(instance.launch?.pid ?? 0)} `
-      + `alive=${String(instance.alive)} cwd ${instance.launch?.cwd ?? '?'}\n`,
+      + `alive=${String(instance.alive)} cwd ${instance.launch?.cwd ?? '?'}${surface}\n`,
     )
     process.stdout.write(
       `                last-good ${instance.baseline === undefined

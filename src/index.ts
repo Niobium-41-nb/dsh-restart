@@ -21,14 +21,17 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type {
-  AgentInfo, AgentStatus, AttemptOutcome, LaunchSpec, RestartReport, ResumeIntent, TrackedFiles,
+  AgentInfo, AgentStatus, AttemptOutcome, LaunchSpec, LaunchSurface, RestartReport, ResumeIntent, TrackedFiles,
 } from './protocol.ts'
-import { ENV_AGENT_TOKEN, ENV_AGENT_URL, ENV_ATTEMPT, ENV_WATCHDOG, STATE_VERSION } from './protocol.ts'
+import {
+  AGENT_CAPABILITY_SURFACES, ENV_AGENT_TOKEN, ENV_AGENT_URL, ENV_ATTEMPT, ENV_WATCHDOG, STATE_VERSION,
+} from './protocol.ts'
 import { ensureDir, isFile, listDir, makeId, nowIso, readJson, sleep, writeJsonAtomic } from './fsx.ts'
 import { expandHomePath, resolveDshHome, resolveStateDir, instanceKey, instancePaths, statePaths, type InstancePaths, type StatePaths } from './paths.ts'
 import {
-  callRestart, ensureAgent, ensureToken, fetchStatus, postReady, readAgentInfo, SPAWN_COMMAND,
+  callRestart, ensureAgent, ensureToken, fetchStatus, postReady, postShutdown, readAgentInfo, SPAWN_COMMAND,
 } from './agent-client.ts'
+import { isDesktopHostEntry } from './relaunch.ts'
 import { readLatestReport, rewriteReport } from './reports.ts'
 import { isAlive } from './agent/process-control.ts'
 import { expandTrackedPaths, readBaselineManifest, takeBaseline } from './snapshot.ts'
@@ -40,7 +43,7 @@ export const name = 'dsh-restart'
 export const inject = ['tools']
 
 /** Version reported in state files. */
-export const PLUGIN_VERSION = '0.1.0'
+export const PLUGIN_VERSION = '0.2.0'
 
 /** Prompt section carrying a restart report; placed after the harness-source block. */
 const REPORT_SECTION = 'dsh-restart:report'
@@ -514,6 +517,38 @@ function profileDirOf(ctx: Context): string | undefined {
   }
 }
 
+/** What a restart has to act on: the harness process alone, or the application hosting it. */
+export interface SurfaceInfo {
+  surface: LaunchSurface
+  /** The application's pid, when {@link SurfaceInfo.surface} is `desktop`. */
+  appPid?: number
+}
+
+/**
+ * Classify this boot as a CLI-launched harness or a desktop application's Host.
+ *
+ * The desktop application runs the very same profile tree in a child process of
+ * its own (`dsh-desktop-host/lib/index.js`, spawned with an IPC channel and
+ * `ELECTRON_RUN_AS_NODE`), and the command line that process carries is the
+ * application's private protocol -- a runtime directory, a profile directory, a
+ * package-manager path -- not something to replay. It also holds no window:
+ * restarting it on its own would leave the application showing an error dialog
+ * over a dead port, so a desktop restart is an *application* restart.
+ *
+ * The IPC channel is what makes this safe rather than merely likely: a Host
+ * started by hand has no parent application to kill, and it must not be
+ * mistaken for one that does.
+ *
+ * @returns the surface this boot belongs to.
+ */
+export function detectSurface(): SurfaceInfo {
+  if (!isDesktopHostEntry(process.argv[1])) return { surface: 'cli' }
+  if (process.send === undefined || process.env['ELECTRON_RUN_AS_NODE'] !== '1') return { surface: 'cli' }
+  const appPid = process.ppid
+  if (!Number.isInteger(appPid) || appPid <= 0 || appPid === process.pid) return { surface: 'cli' }
+  return { surface: 'desktop', appPid }
+}
+
 /**
  * The configuration files a restart should be able to roll back: the profile's
  * own composition surface plus the machine-level patch layer.
@@ -607,6 +642,7 @@ export function apply(ctx: Context, config: Config): void {
   ])]
 
   // ── launch specification ────────────────────────────────────────────────
+  const boot = detectSurface()
   const launchSpec: LaunchSpec = {
     version: STATE_VERSION,
     pid: process.pid,
@@ -622,8 +658,10 @@ export function apply(ctx: Context, config: Config): void {
       )
       : {},
     pluginVersion: PLUGIN_VERSION,
+    surface: boot.surface,
   }
   if (profileDir !== undefined) launchSpec.profileDir = profileDir
+  if (boot.appPid !== undefined) launchSpec.appPid = boot.appPid
 
   /**
    * Write -- or re-assert -- this boot's launch specification.
@@ -648,7 +686,11 @@ export function apply(ctx: Context, config: Config): void {
     updatedAt: nowIso(),
     files: uniqueTracked,
   } satisfies TrackedFiles)
-  log(`instance ${instance.key} (${profileDir ?? 'unknown profile'}) tracks ${String(uniqueTracked.length)} file(s)`)
+  log(`instance ${instance.key} (${profileDir ?? 'unknown profile'}) tracks ${String(uniqueTracked.length)} file(s)`
+    + (boot.surface === 'desktop'
+      ? `; this boot is the desktop application's Host (application pid ${String(boot.appPid ?? 0)}), `
+        + 'so a restart replaces the application'
+      : ''))
 
   // ── control agent ───────────────────────────────────────────────────────
   let agent: AgentInfo | undefined
@@ -1064,6 +1106,10 @@ export function apply(ctx: Context, config: Config): void {
    * `--no-open` is the Web app's own switch for exactly that. It is only
    * appended when a Web surface is actually mounted, because the flag would be
    * a usage error for any other surface's command line.
+   *
+   * A desktop boot gets nothing: its relaunch is the application's own
+   * executable with no arguments, and the application has already opened the
+   * window the user is looking at.
    */
   const webSurfaceMounted = (): boolean => {
     try {
@@ -1074,8 +1120,43 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   const relaunchArgs = (): string[] => {
+    if (boot.surface === 'desktop') return []
     if (!webSurfaceMounted()) return []
     return launchSpec.argv.includes('--no-open') ? [] : ['--no-open']
+  }
+
+  /**
+   * Whether the running control agent can act on this boot's surface.
+   *
+   * The agent is a long-lived process while the plugin is loaded afresh at
+   * every boot, so upgrading this package can leave a plugin that knows about
+   * the desktop application talking to an agent that only knows command lines
+   * -- and replaying a Host command line is how a desktop restart ends up with
+   * a live harness no window is attached to, reported as a success.
+   *
+   * An idle agent is asked to step down so the next handle is a current one. A
+   * busy one is left alone: bouncing it mid-restart is the worse accident.
+   *
+   * @param info - the agent this boot is talking to.
+   * @returns whether it may be handed this restart.
+   */
+  const agentUnderstandsThisBoot = async (info: AgentInfo): Promise<boolean> => {
+    if (boot.surface !== 'desktop') return true
+    const status = await fetchStatus({ info, token, timeoutMs: 2_000 })
+    // "Cannot tell" is not "cannot do"; an unreachable agent is no evidence of
+    // an old one, and refusing a restart is a bigger claim than that.
+    if (status === undefined) return true
+    if (status.capabilities?.includes(AGENT_CAPABILITY_SURFACES) === true) return true
+    if (status.busy) {
+      log('the control agent does not know restart surfaces and is mid-restart; leaving it alone')
+      return false
+    }
+    log('the control agent predates restart surfaces; asking it to stop so a current one takes over')
+    await postShutdown({ info, token })
+    agent = undefined
+    const deadline = Date.now() + 5_000
+    while (Date.now() < deadline && isAlive(info.pid)) await sleep(120)
+    return false
   }
 
   const requestRestart = async (options: {
@@ -1083,12 +1164,25 @@ export function apply(ctx: Context, config: Config): void {
     rollback?: boolean
     requestedBy?: string
   }): Promise<{ accepted: boolean; message: string }> => {
-    const info = await ensureAgentHandle()
+    let info = await ensureAgentHandle()
     if (info === undefined) {
       return {
         accepted: false,
         message: 'the restart control agent is not running; start it with `dsh-restart serve` '
           + `(state directory ${paths.root}) and retry`,
+      }
+    }
+    // An agent that does not know restart surfaces would replay this Host's
+    // command line and orphan the application window from it.
+    if (!await agentUnderstandsThisBoot(info)) {
+      info = await ensureAgentHandle()
+      if (info === undefined || !await agentUnderstandsThisBoot(info)) {
+        return {
+          accepted: false,
+          message: 'the control agent running here predates desktop-application restarts and could not be '
+            + `replaced from ${paths.root}; restart it (node <this package>/lib/agent.js stop) or boot the `
+            + 'application once from a terminal so a current agent takes over',
+        }
       }
     }
     // Re-assert the record of who is running before anyone acts on it.
@@ -1111,12 +1205,15 @@ export function apply(ctx: Context, config: Config): void {
     }, false)
     if (!result.accepted) return { accepted: false, message: result.error }
     scheduleExit()
+    const whatComesBack = boot.surface === 'desktop'
+      ? 'the control agent then relaunches the DeepSeek Harness application (its own window included)'
+      : `the control agent at ${info.url} then relaunches the same command line`
+        + `${appendArgs.length === 0 ? '' : ` with ${appendArgs.join(' ')}`}`
     return {
       accepted: true,
       message: `${result.message} This process exits as soon as the current turn finishes `
         + `(at most ${String(Math.round(resolved.exitWaitForIdleMs / 1000))} s), so write your closing `
-        + `message now: the control agent at ${info.url} then relaunches the same command line`
-        + `${appendArgs.length === 0 ? '' : ` with ${appendArgs.join(' ')}`}, and rolls the configuration `
+        + `message now: ${whatComesBack}, and rolls the configuration `
         + 'back to the last known-good snapshot if the new process fails to start.',
     }
   }
@@ -1128,8 +1225,10 @@ export function apply(ctx: Context, config: Config): void {
       'Restart DeepSeek Harness through the out-of-process restart supervisor. Use this after installing or '
       + 'removing a plugin, editing a profile configuration file, or changing anything the running process '
       + 'froze at startup: those changes need a fresh process, and this call arranges one without the user '
-      + 'touching a terminal. The supervisor relaunches dsh with the exact command line, working directory, '
-      + 'and environment of the current process, then waits for this plugin to confirm a committed startup. '
+      + 'touching a terminal. For a command-line harness the supervisor relaunches dsh with the exact command '
+      + 'line, working directory, and environment of the current process; for the desktop application it '
+      + 'relaunches the application itself, since the window, the port and this process all belong to it. '
+      + 'Either way it waits for this plugin to confirm a committed startup. '
       + 'If the new process dies or never comes up, the supervisor restores the last known-good configuration '
       + 'snapshot, starts again, and leaves a report the restarted harness reads on boot. This call returns '
       + 'immediately and the harness process exits shortly afterwards, so do not promise follow-up tool calls '
