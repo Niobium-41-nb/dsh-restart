@@ -43,7 +43,7 @@ export const name = 'dsh-restart'
 export const inject = ['tools']
 
 /** Version reported in state files. */
-export const PLUGIN_VERSION = '0.2.0'
+export const PLUGIN_VERSION = '0.2.1'
 
 /** Prompt section carrying a restart report; placed after the harness-source block. */
 const REPORT_SECTION = 'dsh-restart:report'
@@ -158,7 +158,7 @@ interface AgentsLike {
   get(id: string): AgentLike | undefined
   resume(options: {
     resumeSessionId: string
-    agentOptions?: { provider: string; model: string }
+    agentOptions?: { provider: string; model: string; reasoningEffort?: string }
     setup?: (agentCtx: unknown, agent: unknown) => void | Promise<void>
   }): Promise<AgentHandleLike>
 }
@@ -177,7 +177,7 @@ interface AgentHandleLike {
 
 /** Structural view of the default-model service, the source of a resume's provider/model. */
 interface AgentDefaultModelLike {
-  currentSelection(): { provider: string; model: string }
+  currentSelection(): { provider: string; model: string; reasoningEffort?: unknown }
 }
 
 /**
@@ -190,6 +190,13 @@ interface AgentDefaultModelLike {
 interface AgentPresetsLike {
   resolve(id: string | undefined): Promise<{ id: string }>
   mount(agentCtx: unknown, id: string): Promise<void>
+  /**
+   * The preset recorded on a session.
+   *
+   * Harness 0.2.2 moved this read onto the preset registry; older registries
+   * do not have it, so the session projection below stays the fallback.
+   */
+  presetForSession?(session: unknown): string | null
 }
 
 /**
@@ -849,6 +856,17 @@ export function apply(ctx: Context, config: Config): void {
    */
   const agentPresetOf = (session: unknown): string | undefined => {
     if (session === undefined || session === null) return undefined
+    // 0.2.2's registry is the owner of this fact and answers synchronously;
+    // `sessionProjections.stateOf` is deprecated there, so it is only the
+    // fallback for harnesses whose registry predates the accessor.
+    try {
+      const presets = ctx.get('agentPresets') as AgentPresetsLike | undefined
+      const recorded = presets?.presetForSession?.(session)
+      if (typeof recorded === 'string' && recorded.length > 0) return recorded
+    } catch (error) {
+      log(`could not read the session's agent preset from the registry: `
+        + `${error instanceof Error ? error.message : String(error)}`)
+    }
     try {
       const projections = ctx.get('sessionProjections') as SessionProjectionsLike | undefined
       const value = projections?.stateOf(session, 'agentPreset')
@@ -997,12 +1015,21 @@ export function apply(ctx: Context, config: Config): void {
       }
     }
 
-    let agentOptions: { provider: string; model: string } | undefined
+    let agentOptions: { provider: string; model: string; reasoningEffort?: string } | undefined
     try {
       const selected = (ctx.get('agentDefaultModel') as AgentDefaultModelLike | undefined)?.currentSelection()
       if (selected !== undefined
         && typeof selected.provider === 'string' && typeof selected.model === 'string') {
-        agentOptions = { provider: selected.provider, model: selected.model }
+        agentOptions = {
+          provider: selected.provider,
+          model: selected.model,
+          // The selection carries the adapter's reasoning effort; dropping it
+          // here would resume the conversation on a different effort tier
+          // than the one the user had chosen.
+          ...(typeof selected.reasoningEffort === 'string' && selected.reasoningEffort.length > 0
+            ? { reasoningEffort: selected.reasoningEffort }
+            : {}),
+        }
       }
     } catch (error) {
       log(`could not read the default model selection: ${error instanceof Error ? error.message : String(error)}`)

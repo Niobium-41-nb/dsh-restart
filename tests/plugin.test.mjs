@@ -506,6 +506,50 @@ process.stdout.write('\nthe requesting session is recorded when a restart is acc
   ok('the log says what will happen next', lines.join('').includes('the next boot wakes it'))
 }
 
+process.stdout.write('\nthe 0.2.2 preset registry is preferred over the deprecated projection\n')
+{
+  rmSync(intentFile(), { force: true })
+  const original = process.stderr.write
+  process.stderr.write = () => true
+  const host = makeHost({
+    web: true,
+    presets: { presetForSession: () => 'registry-preset' },
+    projections: { stateOf: () => 'projection-preset' },
+  })
+  apply(host.ctx, { ...SILENT })
+  const tool = host.tools.find(candidate => candidate.name === 'dsh_restart')
+  await tool.execute(
+    { reason: 'read the preset from the registry' },
+    { agent: { id: 'root', session: { id: 'sess-registry' } } },
+  )
+  process.stderr.write = original
+
+  const intent = JSON.parse(readFileSync(intentFile(), 'utf8'))
+  ok('the registry accessor decides the preset', intent.agentPreset === 'registry-preset', String(intent.agentPreset))
+}
+
+process.stdout.write('\na registry with no recorded preset still reads the projection\n')
+{
+  rmSync(intentFile(), { force: true })
+  const original = process.stderr.write
+  process.stderr.write = () => true
+  const host = makeHost({
+    web: true,
+    presets: { presetForSession: () => null },
+    projections: { stateOf: () => 'projection-preset' },
+  })
+  apply(host.ctx, { ...SILENT })
+  const tool = host.tools.find(candidate => candidate.name === 'dsh_restart')
+  await tool.execute(
+    { reason: 'fall back to the projection' },
+    { agent: { id: 'root', session: { id: 'sess-projection' } } },
+  )
+  process.stderr.write = original
+
+  const intent = JSON.parse(readFileSync(intentFile(), 'utf8'))
+  ok('the projection still answers', intent.agentPreset === 'projection-preset', String(intent.agentPreset))
+}
+
 process.stdout.write('\na restart requested outside a session records nothing\n')
 {
   rmSync(intentFile(), { force: true })
@@ -566,14 +610,15 @@ process.stdout.write('\nthe next boot wakes that session without a prompt\n')
       resolve: async (id) => ({ id: id ?? 'default' }),
       mount: async (_agentCtx, id) => { calls.mounted.push(id) },
     },
-    defaults: { currentSelection: () => ({ provider: 'deepseek', model: 'deepseek-chat' }) },
+    defaults: { currentSelection: () => ({ provider: 'deepseek', model: 'deepseek-chat', reasoningEffort: 'high' }) },
   })
 
   ok('the recorded session is resumed', calls.resume.length === 1
     && calls.resume[0].resumeSessionId === 'sess-wake', JSON.stringify(calls.resume[0]?.resumeSessionId))
   ok('the session preset is mounted again', calls.mounted[0] === 'preset-7', String(calls.mounted[0]))
-  ok('the resume carries the default provider and model',
-    JSON.stringify(calls.resume[0]?.agentOptions) === '{"provider":"deepseek","model":"deepseek-chat"}',
+  ok('the resume carries the default provider, model and reasoning effort',
+    JSON.stringify(calls.resume[0]?.agentOptions)
+      === '{"provider":"deepseek","model":"deepseek-chat","reasoningEffort":"high"}',
     JSON.stringify(calls.resume[0]?.agentOptions))
   ok('exactly one message is queued', calls.followup.length === 1, String(calls.followup.length))
 

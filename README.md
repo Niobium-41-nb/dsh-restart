@@ -41,7 +41,9 @@
 
 ## 安装
 
-要求 harness `>=0.2.1-rc.5 <0.3.0`（`package.json` 里用 `engines.dsh` 声明）。装、卸都走
+要求 harness `>=0.2.1-rc.5 <0.3.0-0`（`package.json` 里用 `engines.dsh` 声明；最新的
+`0.2.2-rc.4` 已覆盖）。上界写成 `<0.3.0-0` 而不是 `<0.3.0`：harness 的门禁用
+`includePrerelease` 判范围，后者会把 `0.3.0-rc.x` 也算成兼容。装、卸都走
 profile 的包管理，插件的客户端半边会顺带进启动图。
 
 **桌面端（`desktop` profile）**——必须用安装目录自带的 CLI，并且**先完全退出应用**
@@ -373,7 +375,7 @@ node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit   # 类型检查
 node node_modules/typescript/bin/tsc -b tsconfig.json            # 编译到 lib/types
 node node_modules/tsdown/dist/run.mjs                            # 打包 lib/index.js + lib/agent.js
 node tests/agent.e2e.mjs                                         # 52 项：Agent 侧（假 harness、CORS、桌面端应用级重启）
-node --experimental-strip-types tests/plugin.test.mjs            # 92 项：插件侧（假 Agent HTTP 服务、启动对账、看门狗派发、surface 识别）
+node --experimental-strip-types tests/plugin.test.mjs            # 94 项：插件侧（假 Agent HTTP 服务、启动对账、看门狗派发、surface 识别）
 node tests/watchdog.test.mjs                                     # 34 项：看门狗二进制（真的跑它，覆盖六种判定 + 桌面端）
 node tests/client.test.mjs                                       # 95 项：客户端指示灯（stub window + slots）
 node tests/lamp.browser.mjs                                      # 25 项：真浏览器里的四种灯态（无 GUI 时跳过）
@@ -387,7 +389,8 @@ node tests/lamp.browser.mjs                                      # 25 项：真�
 那件事写的。
 
 `@deepseek-ai/cordis`、`dsh-tools`、`schemastery` 只用于编译期类型与 `defineTool` 的类型推断，
-版本跟随安装态 harness（当前 0.2.2-rc.1 / cordis 4.0.5 / dsh-tools 0.2.2-rc.1）。
+版本对齐最新发布的 harness（当前 0.2.2-rc.4 / cordis 4.1.0 / dsh-tools 0.2.2-rc.4；本机
+桌面端仍跑 0.2.2-rc.1，两者 API 面一致）。
 以前那种"指向 harness 源码的 junction"已经不用了：harness 现在是安装态，源码在
 `app.asar` 里，包从 npm 取同版本即可。
 

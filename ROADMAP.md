@@ -7,6 +7,32 @@
 
 ---
 
+## ✅ 已完成（2026-11-18）：跟上 0.2.2-rc.4
+
+**需求（用户原话）**：「更新该插件，使其可以适配最新的 deepseek-harness」
+
+- **依赖面**：编译期依赖升到 `dsh-tools 0.2.2-rc.4` / `cordis 4.1.0` / `schemastery 3.19.0`；
+  peer 范围放宽为 `^4.0.5` / `^3.18.5`，同时容纳 0.2.1（cordis 4.0.5）与 0.2.2（4.1.0）。
+- **版本门禁**：`engines.dsh` 的上界从 `<0.3.0` 改成 `<0.3.0-0`。harness 判范围时带
+  `includePrerelease`，旧的写法会把 `0.3.0-rc.x` 也当成兼容；新写法仍然接受
+  `0.2.2-rc.1` / `0.2.2-rc.3` / `0.2.2-rc.4`（默认 semver 下 0.2.2 的预发布会被"仅同 tuple"
+  规则排除，但 harness 开了 includePrerelease）。
+- **API 面**：逐项核对 `defineTool`、`ctx.tools.register`、`appReady`/`appExit`、
+  `agents.resume`/`followup`/`agent/status`、`systemPrompt.section`、`webServer.register`、
+  `slots` 与 `dsh.client` 清单，0.2.2 均未破坏；两处迁移：preset 读取优先
+  `agentPresets.presetForSession(session)`（`stateOf` 已弃用，保留为回退），续跑时把
+  `reasoningEffort` 一并带上。
+- **rc.3 → rc.4**：解包对比了 `dsh-tools`、`dsh-agent`、`dsh-agent-preset-registry`、
+  `dsh-agent-default-model`、`dsh-session-projection`、`dsh-system-prompt` 两版，除
+  `package.json` 的版本引用外**逐字节一致**，rc.4 是纯版本重发，无需额外迁移。
+- **真机核对**：从 0.2.2-rc.3 桌面安装包里解出 `app.asar`，确认 Host 仍是
+  `dsh-desktop-host/lib/index.js`、stdio 仍带 `ipc`、环境仍有 `ELECTRON_RUN_AS_NODE=1`，
+  且 cordis/schemastery 正是 4.1.0/3.19.0；版本门禁用该包内 `semver` 复算过。
+- **验证**：`tsc --noEmit` 对着 0.2.2-rc.4 类型通过；测试新增两条 preset 读取路径与
+  `reasoningEffort` 断言，275 项全绿。
+
+---
+
 ## ✅ 已完成（2026-11-07）：跟上 0.2.x，并支持桌面端
 
 **需求（用户原话）**：「请让该插件支持最新的 deepseek-harness，包括桌面端」「请顺便更新 deepseek-harness」。

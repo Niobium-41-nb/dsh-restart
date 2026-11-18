@@ -30,7 +30,7 @@ import { createAgentServer } from './server.ts'
 import { Supervisor } from './supervisor.ts'
 
 /** Version reported by the agent and required in its health document. */
-export const AGENT_VERSION = '0.2.0'
+export const AGENT_VERSION = '0.2.1'
 
 /** Default loopback control port. */
 const DEFAULT_PORT = 3099
