@@ -43,7 +43,7 @@ export const name = 'dsh-restart'
 export const inject = ['tools']
 
 /** Version reported in state files. */
-export const PLUGIN_VERSION = '0.2.1'
+export const PLUGIN_VERSION = '0.2.2'
 
 /** Prompt section carrying a restart report; placed after the harness-source block. */
 const REPORT_SECTION = 'dsh-restart:report'

@@ -14,7 +14,7 @@ import type { Server } from 'node:http'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { AgentInfo, RestartReport, RestartRequest } from '../protocol.ts'
+import type { AgentInfo, LaunchSpec, RestartReport, RestartRequest } from '../protocol.ts'
 import { STATE_VERSION } from '../protocol.ts'
 import {
   ensureDir, isFile, listDir, nowIso, readJson, writeJsonAtomic,
@@ -30,7 +30,7 @@ import { createAgentServer } from './server.ts'
 import { Supervisor } from './supervisor.ts'
 
 /** Version reported by the agent and required in its health document. */
-export const AGENT_VERSION = '0.2.1'
+export const AGENT_VERSION = '0.2.2'
 
 /** Default loopback control port. */
 const DEFAULT_PORT = 3099
@@ -285,22 +285,36 @@ async function serve(args: ParsedArgs): Promise<number> {
   return await new Promise<number>(() => {})
 }
 
-/** Print local state when no agent is answering. */
+/** Keep captured environment variables out of local status output. */
+function publicLaunch(launch: LaunchSpec | undefined) {
+  if (launch === undefined) return undefined
+  return {
+    version: launch.version,
+    pid: launch.pid,
+    launchId: launch.launchId,
+    startedAt: launch.startedAt,
+    cwd: launch.cwd,
+    execPath: launch.execPath,
+    execArgv: launch.execArgv,
+    argv: launch.argv,
+    surface: launch.surface,
+    appPid: launch.appPid,
+    profileDir: launch.profileDir,
+    webSurface: launch.webSurface,
+    dshVersion: launch.dshVersion,
+    pluginVersion: launch.pluginVersion,
+  }
+}
+
 function printLocalState(paths: ReturnType<typeof statePaths>, args: ParsedArgs): void {
   const instances = listDir(paths.instances).map(key => {
     const instance = instancePaths(paths.root, key)
+    const launch = readJson<LaunchSpec>(instance.launchSpec)
     return {
       key,
-      launch: readJson<{
-        pid?: number
-        cwd?: string
-        argv?: string[]
-        startedAt?: string
-        surface?: string
-        appPid?: number
-      }>(instance.launchSpec),
+      launch: publicLaunch(launch),
       baseline: readBaselineManifest(instance.lastGood),
-      alive: isAlive(readJson<{ pid?: number }>(instance.launchSpec)?.pid ?? 0),
+      alive: isAlive(launch?.pid ?? 0),
     }
   })
   const reports = listDir(paths.reports).filter(name => name.endsWith('.json')).sort().reverse()

@@ -508,6 +508,31 @@ setTimeout(() => process.exit(0), 12_000)
   launcher.kill('SIGKILL')
 }
 
+process.stdout.write('\ntest 9 — local status does not expose launch secrets\n')
+{
+  const apiKey = 'test-only-api-key-do-not-print'
+  const restartToken = 'test-only-restart-token-do-not-print'
+  writeJson(join(instanceDir, 'launch.json'), launchSpec({
+    DEEPSEEK_API_KEY: apiKey,
+    DSH_RESTART_TOKEN: restartToken,
+  }))
+  const local = spawnSync(process.execPath, [join(packageRoot, 'bin', 'dsh-restart'), 'status', '--json'], {
+    env: { ...process.env, DSH_RESTART_STATE_DIR: stateDir },
+    encoding: 'utf8',
+  })
+  check('the extensionless CLI reports local state', local.status === 0, local.stderr ?? '')
+  check('status output omits captured environment variables',
+    !String(local.stdout).includes(apiKey) && !String(local.stdout).includes(restartToken)
+      && !String(local.stdout).includes('"env"'),
+    'a captured secret reached stdout')
+  try {
+    const status = JSON.parse(String(local.stdout))
+    check('status still identifies the instance', status.instances?.[0]?.key === 'e2e', String(local.stdout))
+  } catch (error) {
+    check('status still identifies the instance', false, error.message)
+  }
+}
+
 process.stdout.write(`\n${checks.length - failures.length}/${checks.length} checks passed\n`)
 if (failures.length > 0) {
   process.stdout.write('failures:\n')

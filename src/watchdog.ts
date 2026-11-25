@@ -41,7 +41,7 @@ import {
 import { forceKill, isAlive } from './agent/process-control.ts'
 
 /** Version reported in the watchdog's own log lines. */
-export const WATCHDOG_VERSION = '0.2.1'
+export const WATCHDOG_VERSION = '0.2.2'
 
 /** Default window to wait for somebody else to bring the harness back. */
 const DEFAULT_WAIT_MS = 120_000

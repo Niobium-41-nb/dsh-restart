@@ -21,7 +21,7 @@
     "./client": "./client/index.js"
   },
   "bin": {
-    "dsh-restart": "./bin/dsh-restart.mjs"
+    "dsh-restart": "./bin/dsh-restart"
   },
   "files": [
     "lib",
