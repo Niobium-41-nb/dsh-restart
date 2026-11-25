@@ -51,16 +51,24 @@ profile 的包管理，插件的客户端半边会顺带进启动图。
 
 ```bash
 # 先退出 DeepSeek Harness（托盘也要退），再执行：
-"<DSH_INSTALL>\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add file:<PLUGINS>/dsh-restart
+"<DSH_INSTALL>\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add @vanadium-23/dsh-restart
 ```
 
 **命令行 profile（`web` / `tui` / 自建）**：
 
 ```bash
+dsh plugin --profile web add @vanadium-23/dsh-restart
+```
+
+也可以从本地源码安装：
+
+```bash
+# 桌面端同样需要先完全退出应用
+"<DSH_INSTALL>\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add file:<PLUGINS>/dsh-restart
 dsh plugin --profile web add file:<PLUGINS>/dsh-restart
 ```
 
-`<DSH_INSTALL>` 是桌面应用的安装目录（本机为 `D:\Program Files\deepseek-harness`）。
+`<DSH_INSTALL>` 是桌面应用的安装目录，`<PLUGINS>` 是本地插件源码目录。
 
 `dsh-restart` 的 `package.json` 里声明了 `dsh.bundle.patch`，所以 `dsh plugin add` 会把它
 自动追加进 `dsh.profile.bundles`，**不需要**再手写 `cordis.patch.yml` 的 insert 行
@@ -71,8 +79,10 @@ dsh plugin --profile web add file:<PLUGINS>/dsh-restart
 卸载：
 
 ```bash
-dsh plugin --profile web remove dsh-restart      # 命令行 profile
-"<DSH_INSTALL>\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop remove dsh-restart   # 桌面端，同样先退出应用
+dsh plugin --profile web remove @vanadium-23/dsh-restart                    # 从 npm 安装时
+dsh plugin --profile web remove dsh-restart                                  # 从本地源码安装时
+"<DSH_INSTALL>\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop remove @vanadium-23/dsh-restart
+"<DSH_INSTALL>\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop remove dsh-restart
 ```
 
 > 版本门禁：harness 在安装**之前**会读插件 `package.json` 的 `engines.dsh`（没有就逐个比对
