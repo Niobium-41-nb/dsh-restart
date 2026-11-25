@@ -60,7 +60,8 @@
 
 **做法**：宿主半边在受理重启时把「哪个会话要的重启」写进 `instances/<key>/resume.json`
 （含 reason 与 agent preset）；新进程在 `appReady` 后先认领（写 `consumedAt`）再
-`ctx.agents.resume` + `agent.followup`（`source.kind: 'plugin'`）把会话唤醒。客户端半边在
+`ctx.agents.resume` + `agent.followup`（插件署名的消息：格式 4 会话用 `source.kind: 'plugin:dsh-restart'`，
+格式 3 会话用旧的 `{ kind: 'plugin', plugin }`）把会话唤醒。客户端半边在
 `/dsh-restart/status` 里比对宿主身份，换进程就自动 `location.reload()`，并在新页面右下角画一张
 重启结果卡片。
 

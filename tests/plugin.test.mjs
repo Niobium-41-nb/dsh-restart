@@ -600,7 +600,14 @@ process.stdout.write('\nthe next boot wakes that session without a prompt\n')
     resume: async (options) => {
       calls.resume.push(options)
       if (typeof options.setup === 'function') await options.setup({}, {})
-      return { agent: { followup: (message) => { calls.followup.push(message) } } }
+      return {
+        agent: {
+          // The durable format decides the message-source shape a wake-up may
+          // carry; 4 is what this harness writes.
+          session: { header: { version: 4 } },
+          followup: (message) => { calls.followup.push(message) },
+        },
+      }
     },
   }
   const { log } = await bootHost({
@@ -623,8 +630,14 @@ process.stdout.write('\nthe next boot wakes that session without a prompt\n')
   ok('exactly one message is queued', calls.followup.length === 1, String(calls.followup.length))
 
   const message = calls.followup[0] ?? {}
+  // Format 4 refuses the retired `{ kind: 'plugin', plugin }` wrapper outright
+  // ("format v4 message requires a producer-owned source kind"), and a refused
+  // source fails the *whole resumed turn*, so the wake-up would die exactly
+  // where it is supposed to work. The producer must name itself instead.
   ok('the message is plugin-sourced, never the user',
-    message.source?.kind === 'plugin' && message.source?.plugin === 'dsh-restart', JSON.stringify(message.source))
+    message.source?.kind === 'plugin:dsh-restart', JSON.stringify(message.source))
+  ok('and it does not carry the retired format-4-incompatible wrapper',
+    message.source?.kind !== 'plugin', JSON.stringify(message.source))
   ok('the message carries an identity', typeof message.id === 'string' && message.id.length > 0)
   ok('the message is a user-role message', message.role === 'user', String(message.role))
   const text = message.content?.[0]?.text ?? ''
@@ -639,6 +652,34 @@ process.stdout.write('\nthe next boot wakes that session without a prompt\n')
   const claimed = JSON.parse(readFileSync(intentFile(), 'utf8'))
   ok('the intent is claimed', typeof claimed.consumedAt === 'string' && claimed.consumedAt.length > 0)
   ok('and the claim records the outcome', claimed.outcome === 'resumed', String(claimed.outcome))
+}
+
+process.stdout.write('\na pre-4 session keeps the wrapper its format already knows\n')
+{
+  rmSync(intentFile(), { force: true })
+  writeIntent()
+  const messages = []
+  const { log } = await bootHost({
+    web: true,
+    agents: {
+      get: () => undefined,
+      resume: async () => ({
+        agent: {
+          // Format 3 defined the plugin wrapper and nothing else; format 4
+          // retired it. Both shapes have to stay reachable, so the session the
+          // message will land in decides — not the harness build date.
+          session: { header: { version: 3 } },
+          followup: (message) => { messages.push(message) },
+        },
+      }),
+    },
+  })
+  ok('an older session still gets the wrapper',
+    messages.length === 1
+      && messages[0]?.source?.kind === 'plugin'
+      && messages[0]?.source?.plugin === 'dsh-restart',
+    JSON.stringify(messages[0]?.source))
+  ok('and the wake-up still happens', log.includes('the interrupted task continues without a prompt'))
 }
 
 process.stdout.write('\na claimed intent is never resumed twice\n')
@@ -668,12 +709,19 @@ process.stdout.write('\na session the browser already re-attached is woken, not 
   const { log } = await bootHost({
     web: true,
     agents: {
-      get: (id) => ({ id, status: 'idle', followup: (message) => { calls.push('followup'); messages.push(message) } }),
+      get: (id) => ({
+        id,
+        status: 'idle',
+        session: { header: { version: 4 } },
+        followup: (message) => { calls.push('followup'); messages.push(message) },
+      }),
       resume: async () => { calls.push('resume'); return { agent: { status: 'idle', followup: () => {} } } },
     },
   })
   ok('no second agent is created for a live session', calls.join(',') === 'followup', calls.join(','))
-  ok('the live agent is woken instead', messages.length === 1 && messages[0]?.source?.plugin === 'dsh-restart')
+  ok('the live agent is woken instead',
+    messages.length === 1 && messages[0]?.source?.kind === 'plugin:dsh-restart',
+    JSON.stringify(messages[0]?.source))
   ok('the log says which path was taken', log.includes('already live'), log.split('\n').filter(l => l.includes('resumed')).join(' | '))
   ok('and the claim records the outcome',
     JSON.parse(readFileSync(intentFile(), 'utf8')).outcome === 'resumed')

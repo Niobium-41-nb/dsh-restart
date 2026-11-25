@@ -147,7 +147,8 @@ DeepSeek Harness.exe（Electron 主进程：窗口、单实例锁、更新）
 - **任务自己接着跑，页面自己回来**（默认开）：重启会同时结束这一轮对话和跑它的进程，以前的结果是
   "你得像催一下才继续" —— 现在不用了：
   - 宿主半边在受理重启时记下**是哪个会话要的重启**，新进程启动提交后把那个会话唤醒
-    （`ctx.agents.resume` + 一条 `source.kind: 'plugin'` 的消息），模型从中断处继续干活；
+    （`ctx.agents.resume` + 一条插件署名的消息：`source.kind: 'plugin:dsh-restart'`，格式 3 的旧会话
+    仍是 `{ kind: 'plugin', plugin: 'dsh-restart' }`），模型从中断处继续干活；
   - 浏览器半边每 3 秒问一次宿主的身份，一旦发现回答的**已经不是加载这个页面的那个进程**，
     就自动刷新自己，并在右下角弹一张重启结果卡片（状态 / 耗时 / pid / 报告摘要）。
   详见 [DESIGN.md](DESIGN.md) 第 12 节。想关掉就配 `resumeAfterRestart: false`。

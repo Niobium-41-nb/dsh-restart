@@ -395,8 +395,18 @@ Dsh 的会话是**持久化**的（JSONL），代理是**进程内**的 —— �
 
 ### 11.3 唤醒消息不能被当成用户说的话
 
-唤醒用的是一条 **`source.kind: 'plugin'`** 的用户消息，不是伪造的用户输入 —— 会话记录里能看出
-它不是人打的。文本按 harness 自己的插件框架写法组织（参考 `schedule` 的提醒）：
+唤醒用的是一条**插件署名**的用户消息，不是伪造的用户输入 —— 会话记录里能看出它不是人打的。
+署名形状**由这条会话自己的持久格式决定**，不是写死的：
+
+| 会话格式 | `source` | 为什么 |
+|---|---|---|
+| 4（当前） | `{ kind: 'plugin:dsh-restart' }` | 格式 4 把"生产者"直接写进 `kind`，并且**拒绝**旧的 `{ kind: 'plugin', plugin }` 包装：`format v4 message requires a producer-owned source kind`。这个错误会让**整轮**失败（消息还没落盘就被判非法），也就是"重启后自动续跑"正好死在它要干活的地方 |
+| 3 及更早 | `{ kind: 'plugin', plugin: 'dsh-restart' }` | 旧格式只认这个包装；换成 `plugin:` 前缀它在那边是非法的 |
+
+`plugin:<包名>` 也正是 harness 自己把 v3 会话迁到 v4 时给这个插件的映射，所以两种写法在各自的格式里
+都是"本插件署名"，都不冒充用户。读不到会话头时按当前格式（4）处理 —— 猜"旧"会把正在跑的这棵树弄坏。
+
+文本按 harness 自己的插件框架写法组织（参考 `schedule` 的提醒）：
 
 ```
 [RESTART RESUME]
@@ -485,7 +495,8 @@ import 且带退路**的：这个插件刻意不依赖 harness 的私有包（�
 <br>
 
 `tests/plugin.test.mjs` 里续跑那一段（第 11.2 节）用的是**假 agents 服务**：断言 resume 拿到的
-session id / preset / provider，断言 `followup` 收到的是 `source.kind: 'plugin'` 的消息、
+session id / preset / provider，断言 `followup` 收到的是**插件署名**的消息（格式 4 会话是
+`plugin:dsh-restart`，格式 3 会话是旧包装 —— 两条都测）、
 `reason` 只以 JSON 出现，并把六条"不该动"的路径各测一遍（已认领 / 已在线 / 过期 / 别的实例 /
 没有会话 / resume 抛错），最后确认 `resumeAfterRestart: false` 是整个关掉的。
 

@@ -167,6 +167,13 @@ interface AgentsLike {
 interface AgentLike {
   /** `idle` when nothing is running on it; anything else means work is in flight. */
   status?: unknown
+  /**
+   * The session this agent is driving.
+   *
+   * Only its durable format is read: that is what decides which message-source
+   * shape a wake-up may carry (see {@link producerSource}).
+   */
+  session?: { header?: { version?: unknown } }
   followup(message: unknown): void
 }
 
@@ -272,12 +279,12 @@ export interface Config {
    * the work only continues when the human types something — which is exactly
    * the "go on" message this feature exists to remove.
    *
-   * The wake-up is a plugin-sourced user message (`source.kind: 'plugin'`), so
-   * it never impersonates the user; it carries the restart report and the
-   * reason the model itself gave, and asks it to continue from where it
-   * stopped. The agent then runs a turn nobody typed a prompt for, which is
-   * the point — and the reason a profile that would rather stay quiet can turn
-   * it off.
+   * The wake-up is a plugin-sourced user message, attributed to this package
+   * (`plugin:dsh-restart` on durable format 4), so it never impersonates the
+   * user; it carries the restart report and the reason the model itself gave,
+   * and asks it to continue from where it stopped. The agent then runs a turn
+   * nobody typed a prompt for, which is the point — and the reason a profile
+   * that would rather stay quiet can turn it off.
    */
   resumeAfterRestart: boolean
   /**
@@ -483,6 +490,47 @@ function resumeFraming(intent: ResumeIntent, report: RestartReport | undefined, 
 }
 
 /**
+ * The durable format the agent's session is stored in, when it can be read.
+ *
+ * Format 4 is the one that changed message-source attribution; every session
+ * carries its own format on the header, which is the only honest way to pick a
+ * shape here — the plugin runs on both sides of that change.
+ *
+ * @param agent - the live agent that is about to carry the message.
+ * @returns the header's format number, or undefined when it cannot be read.
+ */
+function sessionFormatVersionOf(agent: unknown): number | undefined {
+  const session = (agent as { session?: { header?: { version?: unknown } } }).session
+  const version = session?.header?.version
+  return typeof version === 'number' ? version : undefined
+}
+
+/**
+ * The message source a wake-up may carry in this session.
+ *
+ * Durable format 4 retired the `{ kind: 'plugin', plugin }` wrapper: a source
+ * must now name its producer directly, and the retired wrapper poisons the
+ * *whole session* rather than one message. The turn dies before it persists
+ * with "format v4 message requires a producer-owned source kind", which reaches
+ * the user as a failed round and leaves the interrupted work exactly where it
+ * was — the opposite of what a resume is for.
+ *
+ * `plugin:<package name>` is the identity format 4 defines for a third-party
+ * producer (it is also what the harness's own v3→v4 migration rewrites this
+ * plugin's older messages to), so a session on format 4 gets that shape and an
+ * older session keeps the wrapper it knows. An unreadable header is treated as
+ * current: guessing "old" would break the harness this plugin is running on.
+ *
+ * @param agent - the live agent that is about to carry the message.
+ * @returns the `source` record of the user message.
+ */
+function producerSource(agent: unknown): Record<string, unknown> {
+  const version = sessionFormatVersionOf(agent)
+  if (version !== undefined && version < 4) return { kind: 'plugin', plugin: name }
+  return { kind: `plugin:${name}` }
+}
+
+/**
  * Build one plugin-sourced user message.
  *
  * `@deepseek-ai/dsh-llm` owns the message shape (identity plus a deep-frozen
@@ -491,11 +539,13 @@ function resumeFraming(intent: ResumeIntent, report: RestartReport | undefined, 
  * to load at plugin-apply time would take the whole harness down with it.
  *
  * @param text - model-visible content.
+ * @param agent - the live agent that will carry the message; its session
+ *   decides which message-source shape is legal there.
  * @returns the message object `followup` accepts.
  */
-async function pluginUserMessage(text: string): Promise<unknown> {
+async function pluginUserMessage(text: string, agent: unknown): Promise<unknown> {
   const content = [{ type: 'text', text }]
-  const source = { kind: 'plugin', plugin: name }
+  const source = producerSource(agent)
   try {
     // Assembled at runtime on purpose: this plugin declares no dependency on
     // the harness's private packages (see the module comment at the top), and a
@@ -976,7 +1026,7 @@ export function apply(ctx: Context, config: Config): void {
      */
     const wake = async (agent: AgentLike, how: string): Promise<void> => {
       const report = await settledReport(paths, resolved.resumeReportWaitMs)
-      agent.followup(await pluginUserMessage(resumeFraming(intent, report, process.pid)))
+      agent.followup(await pluginUserMessage(resumeFraming(intent, report, process.pid), agent))
       settleResumeIntent(claimed, 'resumed')
       log(`resumed session ${intent.sessionId} (${how}): the interrupted task continues without a prompt`)
     }
