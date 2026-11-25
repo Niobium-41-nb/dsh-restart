@@ -5,6 +5,9 @@ lib/
 
 # Scratch state written by the test suites
 .test-state/
+# A manually extracted app.asar used for one-off desktop checks; it is
+# hundreds of megabytes and must never be swept in by `git add -A`.
+.tmp-e2e/
 
 # Editor / OS noise
 .DS_Store
